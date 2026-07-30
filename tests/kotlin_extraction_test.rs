@@ -555,3 +555,30 @@ fn test_kt_language_name() {
     let extractor = KotlinExtractor;
     assert_eq!(extractor.language_name(), "Kotlin");
 }
+
+// -----------------------------------------------------------------------
+// KMP expect/actual grammar probe (#KMP Task 1.1)
+// -----------------------------------------------------------------------
+
+#[test]
+fn probe_expect_actual_parses_without_errors() {
+    let src = "expect fun platformName(): String\n";
+    let result = KotlinExtractor.extract("shared/src/commonMain/kotlin/P.kt", src);
+    assert!(
+        result.errors.is_empty(),
+        "grammar errors on expect: {:?}",
+        result.errors
+    );
+    assert!(
+        result
+            .nodes
+            .iter()
+            .any(|n| n.name == "platformName" && matches!(n.kind, NodeKind::Function)),
+        "expect fun not extracted as a Function node: {:?}",
+        result
+            .nodes
+            .iter()
+            .map(|n| (&n.name, &n.kind))
+            .collect::<Vec<_>>()
+    );
+}
