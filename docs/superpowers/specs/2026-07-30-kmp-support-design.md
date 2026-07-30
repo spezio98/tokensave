@@ -37,14 +37,22 @@ This is purely path-convention based — no Gradle parsing required (that's Phas
 
 ### Schema
 
-New migration (`db/migrations.rs`, next `LATEST_VERSION`), adding to `nodes`:
+New migration `V15` (`db/migrations.rs`, current `LATEST_VERSION = 14` → bump to `15`). All three KMP columns land in this single migration (Phase 0's `source_set` + `kmp_module_root`, plus Phase 1's `kmp_role`), since the same extractor code path populates them together:
 
 ```sql
 ALTER TABLE nodes ADD COLUMN source_set TEXT NULL;
 ALTER TABLE nodes ADD COLUMN kmp_module_root TEXT NULL;
+ALTER TABLE nodes ADD COLUMN kmp_role TEXT NULL; -- 'expect' | 'actual' | NULL (Phase 1)
 ```
 
-Populated by extractors at insert time (like `visibility`/`is_async` today), not computed at query time. Any extractor can call `kmp_location_from_path(file_path)` when building a `Node` — initially wired into `KotlinExtractor` only (Swift/other KMP-relevant files can adopt it later without a schema change).
+Populated by extractors at insert time. Any extractor can call `kmp_location_from_path(file_path)` when building a `Node` — initially wired into `KotlinExtractor` only (Swift/other KMP-relevant files can adopt it later without a schema change).
+
+**Schema blast radius (do not underestimate).** The DB layer is **positional, column-index based** — this is not a `visibility`/`is_async`-scale change. Appending columns lands them at indices 28–30, and every one of these sites must be updated in lockstep:
+
+- **`row_to_node` (`db/queries/mod.rs:76`)** — add tolerant reads for the three new columns (`row.get(28).ok()...` pattern, mirroring the issue-#150 health columns at indices 23–27 which read via `unwrap_or`), so older SELECT lists that omit them don't error.
+- **All three `INSERT OR REPLACE INTO nodes` statements** (`db/queries/nodes.rs:13`, `:118`, `:274`) — each lists columns and positional bind params; all three must add the three columns + bindings.
+- **SELECT lists across `db/queries/`** — tolerant reads mean an omitting SELECT silently yields `NULL`. That's the trap: **the SELECT that loads nodes for the resolver (Phase 1) MUST include the three new columns**, or `row_to_node` reads `None` and KMP matching fails silently with no error. Audit every SELECT feeding `row_to_node` and confirm the resolver-loading one is updated.
+- **`Node` struct (`types.rs:335`)** — add `source_set: Option<String>`, `kmp_module_root: Option<String>`, `kmp_role: Option<String>` fields.
 
 ## Phase 1 — expect/actual Linking
 
@@ -54,24 +62,22 @@ Before writing extraction logic, confirm `tree-sitter-kotlin-sg` v0.4.1 actually
 
 ### Schema
 
-Same migration as Phase 0 (single migration bump adds all three `nodes` columns together — `source_set`, `kmp_module_root`, `kmp_role` — since they're always populated together by the same extractor code path):
-
-```sql
-ALTER TABLE nodes ADD COLUMN kmp_role TEXT NULL; -- 'expect' | 'actual' | NULL
-```
+The `kmp_role` column ships in the same `V15` migration described in Phase 0 (all three columns together) — see the Phase 0 schema section for the full column list and the blast-radius checklist that applies here too.
 
 ### Extractor changes (`kotlin_extractor.rs`)
 
 Reuse the existing `has_modifier_keyword(node, state, keyword)` helper, calling it with `"expect"` and `"actual"` at the same call sites already used for `"data"`/`"sealed"` (function, class, object, property, interface declarations). Set `Node.kmp_role` accordingly.
 
-For every node where `kmp_role == Some("actual")`, additionally emit an `UnresolvedRef`:
+For every node where `kmp_role == Some("actual")`, additionally emit an `UnresolvedRef`. Note the actual field names of the struct (`types.rs:409`) — `from_node_id` / `reference_name` / `reference_kind`, plus the required `column` and `file_path`:
 
 ```rust
 UnresolvedRef {
-    source: node.id.clone(),
-    target_name: node.qualified_name.clone(),
-    kind: EdgeKind::ActualFor,
+    from_node_id: node.id.clone(),
+    reference_name: node.qualified_name.clone(),
+    reference_kind: EdgeKind::ActualFor,
     line: node.start_line,
+    column: node.start_column,
+    file_path: node.file_path.clone(),
 }
 ```
 
@@ -81,15 +87,30 @@ This reuses the existing generic `unresolved_refs → resolve_all → create_edg
 
 New variant: `EdgeKind::ActualFor` (source = `actual` node, target = `expect` node). Direction chosen so an `expect` naturally has fan-in from N `actual`s (one per platform), rather than modeling fan-out from a single node.
 
+Adding the variant is not just the enum — both `EdgeKind` match arms are exhaustive and must gain the new case, or edges won't round-trip through the DB (stored as `TEXT`):
+
+- `EdgeKind::as_str` (`types.rs:266`) → `EdgeKind::ActualFor => "actual_for"`
+- `EdgeKind::from_str` (`types.rs:283`) → `"actual_for" => Some(EdgeKind::ActualFor)`
+
 ### Resolver changes (`resolver.rs`)
 
 New dedicated matching strategy, following the existing `try_go_selector_match` pattern (a targeted branch alongside the generic scorer, not a modification to it):
 
 ```rust
-fn try_kmp_actual_match(&self, r: &UnresolvedRef) -> Option<ResolvedRef>
+fn try_kmp_actual_match(&self, uref: &UnresolvedRef) -> Option<ResolvedRef>
 ```
 
-When `r.kind == EdgeKind::ActualFor`: restrict candidates to nodes with `kmp_role == Some("expect")`, matching `kmp_module_root`, and exact `qualified_name` match. No cross-language penalty applies (always same language). `kind_compatible` requires the target's `NodeKind` to equal the source's `NodeKind` (fun↔fun, class↔class, etc.) — `expect`/`actual` pairs are always the same declaration shape.
+**Dispatch placement is critical.** `resolve_one` (`resolver.rs:399`) dispatches by the *shape* of `reference_name` (contains `::` → qualified match; contains `.` → dotted-receiver; else exact name), **not** by `reference_kind`. Kotlin qualified names use `::` (`kotlin_extractor.rs:197`), so an `ActualFor` ref whose `reference_name` is the actual's own qualified name would fall into Strategy 1 (qualified match). That is wrong: the `expect` and **all** its `actual`s share the *same* qualified name, so `qualified_name_cache` returns the whole family — the generic strategy would match ambiguously, and could even match the actual to itself.
+
+Therefore the KMP strategy must be dispatched **on `reference_kind`, at the very top of `resolve_one`, before the `Uses`-skip block and before Strategy 1**:
+
+```rust
+if uref.reference_kind == EdgeKind::ActualFor {
+    return self.try_kmp_actual_match(uref);
+}
+```
+
+Inside `try_kmp_actual_match`: look up `qualified_name_cache` for `uref.reference_name`, then restrict candidates to nodes where `kmp_role == Some("expect")` **and** `kmp_module_root` equals the source node's `kmp_module_root` (prevents cross-module false matches for same-named declarations) **and** `NodeKind` equals the source node's kind (fun↔fun, class↔class — `expect`/`actual` pairs are always the same declaration shape). No cross-language penalty is involved — this strategy bypasses the generic scorer entirely, like `try_go_selector_match`. To read the source node's `kmp_module_root`/kind, look it up by `uref.from_node_id` (the resolver's node cache holds full `&Node` refs, `resolver.rs:269`).
 
 Fan-out across platforms falls out for free: each `actual` node emits its own `UnresolvedRef`, independently resolved to the same `expect` target, producing N `ActualFor` edges converging on one node.
 
@@ -111,14 +132,26 @@ Called after `expand_subgraph`'s existing trim/edge-recovery step. For every nod
 
 ### Formatter (`context/formatter.rs`)
 
-In `format_context_as_markdown`, when rendering a code block's header for a node with `kmp_role.is_some()`, append a label derived from the node's `kmp_role` and `source_set`:
+Target header format (current code-block header is `#### {label} ({file}:{line})`, `formatter.rs:143`), with a KMP label inserted when the node has a `kmp_role`:
 
 ```
 #### foo [expect · commonMain] (shared/src/commonMain/kotlin/Foo.kt:12)
 #### foo [actual · iosMain] (shared/src/iosMain/kotlin/Foo.kt:8)
 ```
 
-Makes the platform variant explicit without requiring the reader (human or AI) to infer it from the file path.
+**Structural gap to resolve first.** The formatter cannot see `kmp_role`/`source_set` today:
+
+- `CodeBlock` (`types.rs:635`) carries only `node_id: Option<String>` — not the node's fields.
+- The header `label` is currently resolved by looking `block.node_id` up **only against `context.entry_points`** (falling back to the raw node_id). A sibling `actual` pulled in by the Phase 2 completion pass is usually **not** an entry point, so this lookup wouldn't find it at all.
+
+Pick one of two mechanisms (decide in the implementation plan):
+
+1. **Extend `CodeBlock`** with `kmp_role: Option<String>` and `source_set: Option<String>`, populated where code blocks are built (`context/builder.rs`), so the formatter reads them directly. Simpler formatter, small struct/serialization change.
+2. **Pass a `node_id → &Node` map covering the whole subgraph** (not just entry_points) into `format_context_as_markdown`, and look up role/source_set there. No struct change, but a new formatter parameter.
+
+Recommendation: option 1 (keeps the formatter a pure function of its inputs; the builder already has the `Node` in hand when it creates each block).
+
+Also update **`format_context_as_json`** (`formatter.rs:173`) so the same `kmp_role`/`source_set` surface in JSON output — otherwise the two output formats disagree on what they expose.
 
 ## Testing
 
