@@ -415,6 +415,17 @@ pub struct UnresolvedRef {
     pub file_path: String,
 }
 
+/// A row in the `kmp_declarations` side table: tags a node as an `expect` or
+/// `actual` KMP declaration, with its source set and owning module. Stored off
+/// to the side so no column is added to `Node`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KmpDeclaration {
+    pub node_id: String,
+    pub source_set: String,
+    pub module_root: String,
+    pub role: String, // "expect" | "actual"
+}
+
 /// Result of extracting code entities from a file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionResult {

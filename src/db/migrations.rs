@@ -15,7 +15,7 @@ use crate::errors::{Result, TokenSaveError};
 
 /// The highest migration version defined in this file. Bump this and add a
 /// new entry to `run_migration` whenever the schema changes.
-const LATEST_VERSION: u32 = 14;
+const LATEST_VERSION: u32 = 15;
 
 pub(crate) const TRAIT_DISPATCH_TRIGGERS_SQL: &str = r"
 CREATE TRIGGER IF NOT EXISTS trait_dispatch_call_insert
@@ -334,7 +334,16 @@ pub async fn create_schema(conn: &Connection) -> Result<()> {
                 VALUES ('delete', OLD.id, OLD.text, OLD.reason);
                 INSERT INTO memory_decisions_fts(rowid, text, reason)
                 VALUES (NEW.id, NEW.text, NEW.reason);
-            END;",
+            END;
+
+        CREATE TABLE IF NOT EXISTS kmp_declarations (
+            node_id     TEXT PRIMARY KEY,
+            source_set  TEXT NOT NULL,
+            module_root TEXT NOT NULL,
+            role        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kmp_declarations_role
+            ON kmp_declarations(role);",
     )
     .await
     .map_err(|e| TokenSaveError::Database {
@@ -434,6 +443,7 @@ async fn run_migration(conn: &Connection, version: u32) -> Result<()> {
         12 => migrate_v12(conn).await,
         13 => migrate_v13(conn).await,
         14 => migrate_v14(conn).await,
+        15 => migrate_v15(conn).await,
         _ => Err(TokenSaveError::Database {
             message: format!("unknown migration version: {version}"),
             operation: "run_migration".to_string(),
@@ -1323,6 +1333,33 @@ async fn migrate_v14(conn: &Connection) -> Result<()> {
         operation: "migrate_v14".to_string(),
     })?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V15: KMP declarations side table
+// ---------------------------------------------------------------------------
+
+/// Adds `kmp_declarations`, a side table tagging nodes as `expect`/`actual`
+/// Kotlin Multiplatform declarations with their source set and owning module.
+/// Kept separate from `nodes` so no positional column is added to the core
+/// schema.
+async fn migrate_v15(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS kmp_declarations (
+            node_id     TEXT PRIMARY KEY,
+            source_set  TEXT NOT NULL,
+            module_root TEXT NOT NULL,
+            role        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kmp_declarations_role
+            ON kmp_declarations(role);",
+    )
+    .await
+    .map_err(|e| TokenSaveError::Database {
+        message: format!("v15: failed to create kmp_declarations: {e}"),
+        operation: "migrate_v15".to_string(),
+    })?;
     Ok(())
 }
 

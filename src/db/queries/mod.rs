@@ -11,6 +11,7 @@ mod clear;
 mod edges;
 mod files;
 mod fingerprints;
+mod kmp;
 mod metadata;
 mod nodes;
 mod search;
