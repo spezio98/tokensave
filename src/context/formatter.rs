@@ -140,10 +140,18 @@ pub fn format_context_as_markdown(context: &TaskContext) -> String {
                 "unknown".to_string()
             };
 
+            let kmp = block
+                .node_id
+                .as_ref()
+                .and_then(|id| context.kmp_labels.get(id))
+                .map(|(role, source_set)| format!(" [{role} · {source_set}]"))
+                .unwrap_or_default();
+
             let _ = writeln!(
                 out,
-                "#### {} ({}:{})",
+                "#### {}{} ({}:{})",
                 label,
+                kmp,
                 block.file_path,
                 block.start_line + 1,
             );
@@ -189,6 +197,7 @@ mod tests {
             code_blocks: vec![],
             related_files: vec![],
             seen_node_ids: vec![],
+            kmp_labels: std::collections::HashMap::new(),
         }
     }
 
@@ -247,6 +256,7 @@ mod tests {
             code_blocks: vec![],
             related_files: vec!["src/lib.rs".to_string()],
             seen_node_ids: vec![],
+            kmp_labels: std::collections::HashMap::new(),
         };
 
         let md = format_context_as_markdown(&ctx);
@@ -301,12 +311,34 @@ mod tests {
             }],
             related_files: vec!["src/main.rs".to_string()],
             seen_node_ids: vec![],
+            kmp_labels: std::collections::HashMap::new(),
         };
 
         let md = format_context_as_markdown(&ctx);
         assert!(md.contains("#### my_fn (src/main.rs:2)"));
         assert!(md.contains("```rust"));
         assert!(md.contains("fn my_fn()"));
+    }
+
+    #[test]
+    fn markdown_shows_kmp_label() {
+        let mut ctx = make_test_context();
+        ctx.code_blocks = vec![CodeBlock {
+            content: "actual fun foo() {}".to_string(),
+            file_path: "shared/src/iosMain/kotlin/Foo.kt".to_string(),
+            start_line: 7,
+            end_line: 8,
+            node_id: Some("nid".to_string()),
+        }];
+        ctx.kmp_labels.insert(
+            "nid".to_string(),
+            ("actual".to_string(), "iosMain".to_string()),
+        );
+        let md = format_context_as_markdown(&ctx);
+        assert!(
+            md.contains("[actual · iosMain]"),
+            "missing kmp label:\n{md}"
+        );
     }
 
     #[test]

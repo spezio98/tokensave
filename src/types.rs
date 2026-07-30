@@ -643,6 +643,12 @@ pub struct TaskContext {
     pub related_files: Vec<String>,
     /// IDs of all nodes returned as entry points (pass to next call's `exclude_node_ids` for dedup).
     pub seen_node_ids: Vec<String>,
+    /// Maps a node id to its `(role, source_set)` KMP label (e.g. `("actual",
+    /// "iosMain")`), for nodes in `subgraph`/`code_blocks` that are `expect`/
+    /// `actual` declarations. Empty for non-KMP contexts. Not part of the
+    /// persisted graph — derived at context-build time.
+    #[serde(default)]
+    pub kmp_labels: HashMap<String, (String, String)>,
 }
 
 /// A block of source code extracted from a file.

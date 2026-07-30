@@ -44,6 +44,7 @@ impl<'a> ContextBuilder<'a> {
         let entry_points = self.find_entry_points(query, &symbols, options).await?;
         let mut subgraph = self.expand_subgraph(&entry_points, options).await?;
         let kmp_extra_nodes = self.complete_kmp_families(&mut subgraph).await?;
+        let kmp_labels = self.build_kmp_labels(&subgraph).await?;
 
         // Step 4: extract code blocks from source files. Includes any KMP
         // family members pulled in above (e.g. a sibling platform actual)
@@ -84,7 +85,24 @@ impl<'a> ContextBuilder<'a> {
             code_blocks,
             related_files,
             seen_node_ids,
+            kmp_labels,
         })
+    }
+
+    /// Builds the `node_id -> (role, source_set)` KMP label map for every
+    /// node in `subgraph` that is an `expect`/`actual` declaration, so the
+    /// formatter can tag code blocks with their platform without needing a
+    /// `Node`-struct field.
+    async fn build_kmp_labels(
+        &self,
+        subgraph: &Subgraph,
+    ) -> Result<HashMap<String, (String, String)>> {
+        let ids: Vec<String> = subgraph.nodes.iter().map(|n| n.id.clone()).collect();
+        let decls = self.db.get_kmp_declarations_for(&ids).await?;
+        Ok(decls
+            .into_iter()
+            .map(|d| (d.node_id, (d.role, d.source_set)))
+            .collect())
     }
 
     /// Finds the relevant subgraph for a query without extracting code blocks.

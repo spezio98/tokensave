@@ -87,4 +87,19 @@ async fn context_completes_kmp_family_under_tight_budget() {
         code_files.iter().any(|f| f.contains("iosMain")),
         "ios sibling's code missing from code_blocks: {code_files:?}"
     );
+
+    // Markdown output labels each platform variant explicitly.
+    let md = tokensave::context::format_context_as_markdown(&ctx);
+    assert!(
+        md.contains("[expect · commonMain]"),
+        "missing expect label:\n{md}"
+    );
+    assert!(
+        md.contains("[actual · androidMain]"),
+        "missing android actual label:\n{md}"
+    );
+    assert!(
+        md.contains("[actual · iosMain]"),
+        "missing ios actual label:\n{md}"
+    );
 }
