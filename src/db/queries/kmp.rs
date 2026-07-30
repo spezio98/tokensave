@@ -96,4 +96,21 @@ impl Database {
         }
         Ok(out)
     }
+
+    /// Returns all `ActualFor` edges where `node_id` is the source or target.
+    pub async fn get_actual_for_edges_for(&self, node_id: &str) -> Result<Vec<Edge>> {
+        let mut rows = self
+            .conn()
+            .query(
+                "SELECT source, target, kind, line FROM edges
+                 WHERE kind = 'actual_for' AND (source = ?1 OR target = ?1)",
+                params![node_id],
+            )
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query actual_for edges: {e}"),
+                operation: "get_actual_for_edges_for".to_string(),
+            })?;
+        collect_rows(&mut rows, row_to_edge, "get_actual_for_edges_for").await
+    }
 }
