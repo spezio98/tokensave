@@ -155,10 +155,14 @@ for each ActualFor edge (source = actual_id, target = expect_id):
 Default BFS is proximity-bound (`traversal_depth`, `max_nodes`), but a sibling `actual` reachable only via `actual-A → expect → actual-B` is 2 hops away and can be dropped by depth/node-count limits or truncation even though it's always relevant. Add a dedicated completion pass:
 
 ```rust
-fn complete_kmp_families(subgraph: &mut Subgraph, db: &Database) -> Result<()>
+async fn complete_kmp_families(&self, subgraph: &mut Subgraph) -> Result<Vec<Node>>
 ```
 
-Called after `expand_subgraph`'s existing trim/edge-recovery step. It queries `kmp_declarations` for the subgraph's node IDs (`SELECT node_id, role FROM kmp_declarations WHERE node_id IN (...)`) to find which nodes are KMP declarations; for each, it queries the DB for all `ActualFor` edges where the node is source or target, and adds any missing counterpart nodes/edges — bypassing `max_nodes` for this addition (bounded in practice to the number of KMP targets, typically 2–5). Because role lives in `kmp_declarations` (not on `Node`), this pass needs no node-struct field.
+Called after `expand_subgraph`'s existing trim/edge-recovery step, from both `build_context` and `find_relevant_context`. It queries `kmp_declarations` for the subgraph's node IDs to find which nodes are KMP declarations, then walks `ActualFor` edges outward, adding missing counterpart nodes/edges — bypassing `max_nodes` for this addition (bounded in practice to the number of KMP targets, typically 2–5). Because role lives in `kmp_declarations` (not on `Node`), this pass needs no node-struct field.
+
+**Must be a fixed-point walk, not a single pass over the seed nodes.** An earlier version queried `ActualFor` edges only for the nodes already in the subgraph (e.g. one `actual`), found the `expect`, and stopped — missing sibling `actual`s that are only discoverable via *the expect's own* incoming edges (the fan-in from other platforms). A queue of node IDs seeded from the subgraph and grown with every newly-discovered node — draining until nothing new turns up — is what actually reaches the full family: discovering the `expect` re-queues it, and processing it surfaces every other platform's `actual`.
+
+**Code blocks must also cover the completed family, not just entry points.** `extract_code_blocks` (called from `build_context`) iterates `entry_points`, not `subgraph.nodes` — a sibling pulled in by `complete_kmp_families` is usually not itself an entry point, so without change it would appear in the "Related Symbols" file:line list but its actual code would never be read. `complete_kmp_families` returns the newly-added nodes; `build_context` feeds `entry_points` chained with that list into `extract_code_blocks`, so the AI reads the sibling's implementation, not just its location.
 
 ### Formatter (`context/formatter.rs`)
 
