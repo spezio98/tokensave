@@ -31,28 +31,29 @@ pub struct KmpLocation {
 pub fn kmp_location_from_path(file_path: &str) -> Option<KmpLocation>;
 ```
 
-`kmp_location_from_path` scans path segments for one matching `^[a-z][a-zA-Z0-9]*(Main|Test)$` immediately inside a `src/` segment (i.e. `.../src/{segment}/...`). The prefix before `Main`/`Test` becomes the target: `"common"` → `KmpTarget::Common`, anything else → `KmpTarget::Platform(prefix)`. `module_root` is the path up to (excluding) `src/`. Returns `None` for non-KMP-shaped paths (e.g. plain `src/main/kotlin/...` single-platform Android/JVM layout) — those nodes get `source_set = NULL`.
+`kmp_location_from_path` scans path segments for one matching `^[a-z][a-zA-Z0-9]*(Main|Test)$` immediately inside a `src/` segment (i.e. `.../src/{segment}/...`). The prefix before `Main`/`Test` becomes the target: `"common"` → `KmpTarget::Common`, anything else → `KmpTarget::Platform(prefix)`. `module_root` is the path up to (excluding) `src/`. Returns `None` for non-KMP-shaped paths (e.g. plain `src/main/kotlin/...` single-platform Android/JVM layout).
 
-This is purely path-convention based — no Gradle parsing required (that's Phase 3).
+This is purely path-convention based — no Gradle parsing required (that's Phase 3). Because source-set and module-root are a **pure function of `file_path`**, they are never stored on the node — any consumer (resolver, formatter, context builder) derives them on demand by calling `kmp_location_from_path` on the node's existing `file_path`. No `Node` column or field is added.
 
-### Schema
+### Schema — side table only (deliberate: avoids struct blast radius)
 
-New migration `V15` (`db/migrations.rs`, current `LATEST_VERSION = 14` → bump to `15`). All three KMP columns land in this single migration (Phase 0's `source_set` + `kmp_module_root`, plus Phase 1's `kmp_role`), since the same extractor code path populates them together:
+**Design constraint that drove this.** Adding a field to `Node` (`types.rs:335`) or to `ExtractionResult` (`types.rs:420`) is prohibitively invasive: `Node` is built via explicit struct literals in ~50 extractor files (hundreds of sites, every one must init every field or it won't compile), the DB layer is positional-column-index based (3 `INSERT` sites in `db/queries/nodes.rs`, 18 identical SELECT lists, `row_to_node` at `mod.rs:76`), and `ExtractionResult` is likewise literal-constructed per extractor. So KMP data lives **entirely off to the side** — no shared struct changes at all.
+
+New migration `V15` (`db/migrations.rs`, current `LATEST_VERSION = 14` → bump to `15`) creates one table:
 
 ```sql
-ALTER TABLE nodes ADD COLUMN source_set TEXT NULL;
-ALTER TABLE nodes ADD COLUMN kmp_module_root TEXT NULL;
-ALTER TABLE nodes ADD COLUMN kmp_role TEXT NULL; -- 'expect' | 'actual' | NULL (Phase 1)
+CREATE TABLE IF NOT EXISTS kmp_declarations (
+    node_id     TEXT PRIMARY KEY,
+    source_set  TEXT NOT NULL,   -- e.g. "commonMain", "androidMain", "iosMain"
+    module_root TEXT NOT NULL,   -- dir containing src/, e.g. "shared"
+    role        TEXT NOT NULL    -- 'expect' | 'actual'
+);
+CREATE INDEX IF NOT EXISTS idx_kmp_declarations_role ON kmp_declarations(role);
 ```
 
-Populated by extractors at insert time. Any extractor can call `kmp_location_from_path(file_path)` when building a `Node` — initially wired into `KotlinExtractor` only (Swift/other KMP-relevant files can adopt it later without a schema change).
+Follows the migration pattern of `migrate_v8` (`CREATE TABLE IF NOT EXISTS` + index, `migrations.rs:754`). Add `14 => migrate_v14` sibling `15 => migrate_v15` to the dispatch match (`migrations.rs:422`).
 
-**Schema blast radius (do not underestimate).** The DB layer is **positional, column-index based** — this is not a `visibility`/`is_async`-scale change. Appending columns lands them at indices 28–30, and every one of these sites must be updated in lockstep:
-
-- **`row_to_node` (`db/queries/mod.rs:76`)** — add tolerant reads for the three new columns (`row.get(28).ok()...` pattern, mirroring the issue-#150 health columns at indices 23–27 which read via `unwrap_or`), so older SELECT lists that omit them don't error.
-- **All three `INSERT OR REPLACE INTO nodes` statements** (`db/queries/nodes.rs:13`, `:118`, `:274`) — each lists columns and positional bind params; all three must add the three columns + bindings.
-- **SELECT lists across `db/queries/`** — tolerant reads mean an omitting SELECT silently yields `NULL`. That's the trap: **the SELECT that loads nodes for the resolver (Phase 1) MUST include the three new columns**, or `row_to_node` reads `None` and KMP matching fails silently with no error. Audit every SELECT feeding `row_to_node` and confirm the resolver-loading one is updated.
-- **`Node` struct (`types.rs:335`)** — add `source_set: Option<String>`, `kmp_module_root: Option<String>`, `kmp_role: Option<String>` fields.
+**This table is populated in a post-resolution pass, not by the extractor** (see Phase 1) — so nothing threads through `Node`/`ExtractionResult`. `role` and `source_set` are both *derived*: `role` from `ActualFor` edge membership, `source_set`/`module_root` from `file_path`.
 
 ## Phase 1 — expect/actual Linking
 
@@ -62,26 +63,33 @@ Before writing extraction logic, confirm `tree-sitter-kotlin-sg` v0.4.1 actually
 
 ### Schema
 
-The `kmp_role` column ships in the same `V15` migration described in Phase 0 (all three columns together) — see the Phase 0 schema section for the full column list and the blast-radius checklist that applies here too.
+No new schema in Phase 1 — the `kmp_declarations` table (Phase 0) holds everything. Phase 1 fills it.
+
+### Role handling — derived, never stored on the node
+
+There is no `kmp_role` field anywhere on `Node`. Roles are derived:
+
+- A node is an **`actual`** if it is the *source* of an `ActualFor` edge.
+- A node is an **`expect`** if it is the *target* of an `ActualFor` edge.
+
+The Kotlin extractor's only job is to emit an `ActualFor` unresolved ref for each `actual`-modified declaration (below). `expect` nodes need no marking at extraction time — they are discovered as `ActualFor` targets after resolution. (A standalone `expect` with no `actual` is invalid KMP — every `expect` requires an `actual` per target — so edge-derived roles cover all valid code.)
 
 ### Extractor changes (`kotlin_extractor.rs`)
 
-Reuse the existing `has_modifier_keyword(node, state, keyword)` helper, calling it with `"expect"` and `"actual"` at the same call sites already used for `"data"`/`"sealed"` (function, class, object, property, interface declarations). Set `Node.kmp_role` accordingly.
-
-For every node where `kmp_role == Some("actual")`, additionally emit an `UnresolvedRef`. Note the actual field names of the struct (`types.rs:409`) — `from_node_id` / `reference_name` / `reference_kind`, plus the required `column` and `file_path`:
+Reuse the existing `has_modifier_keyword(node, state, keyword)` helper (`kotlin_extractor.rs:1283`), calling it with `"actual"` at the same call sites already using `"data"`/`"sealed"` (function `:356`, plus class/object/property/interface). When a declaration has the `actual` modifier, push an `UnresolvedRef` onto `state.unresolved_refs` — the exact same channel the extractor already uses for `Uses`/`Extends`/`Annotates` refs (`kotlin_extractor.rs:336`), so **no struct or pipeline change**:
 
 ```rust
-UnresolvedRef {
-    from_node_id: node.id.clone(),
-    reference_name: node.qualified_name.clone(),
+state.unresolved_refs.push(UnresolvedRef {
+    from_node_id: id.clone(),
+    reference_name: qualified_name.clone(),
     reference_kind: EdgeKind::ActualFor,
-    line: node.start_line,
-    column: node.start_column,
-    file_path: node.file_path.clone(),
-}
+    line: start_line,
+    column: start_column,
+    file_path: state.file_path.clone(),
+});
 ```
 
-This reuses the existing generic `unresolved_refs → resolve_all → create_edges` pipeline unchanged — no new collection/dispatch machinery.
+`expect` modifier is *not* checked at extraction time. This reuses the existing generic `unresolved_refs → resolve_all → create_edges` pipeline unchanged.
 
 ### `types.rs`
 
@@ -110,9 +118,27 @@ if uref.reference_kind == EdgeKind::ActualFor {
 }
 ```
 
-Inside `try_kmp_actual_match`: look up `qualified_name_cache` for `uref.reference_name`, then restrict candidates to nodes where `kmp_role == Some("expect")` **and** `kmp_module_root` equals the source node's `kmp_module_root` (prevents cross-module false matches for same-named declarations) **and** `NodeKind` equals the source node's kind (fun↔fun, class↔class — `expect`/`actual` pairs are always the same declaration shape). No cross-language penalty is involved — this strategy bypasses the generic scorer entirely, like `try_go_selector_match`. To read the source node's `kmp_module_root`/kind, look it up by `uref.from_node_id` (the resolver's node cache holds full `&Node` refs, `resolver.rs:269`).
+Inside `try_kmp_actual_match` (all fields derived on the fly — nothing is read from a stored KMP column):
+
+1. Look up the source (`actual`) node by `uref.from_node_id` in the resolver's node cache (holds full `&Node` refs, `resolver.rs:269`). Compute its location: `let src = kmp_location_from_path(&source_node.file_path)?;`.
+2. Get candidates from `qualified_name_cache[uref.reference_name]` (the `expect` and all sibling `actual`s share this qualified name).
+3. Keep only candidates where: (a) `kmp_location_from_path(candidate.file_path)` yields the **same `module_root`** as `src` (prevents cross-module false matches), (b) `candidate.kind == source_node.kind` (fun↔fun, class↔class), and (c) the candidate is the **`expect`** — identified structurally as the one whose `source_set` target is `Common` (KMP requires `expect` to live in a common source set), or, if none is `Common`, the single candidate in a source set that differs from every `actual`'s. Exclude the source node itself.
+4. Return a `ResolvedRef` to that node. This bypasses the generic scorer entirely, like `try_go_selector_match` — no cross-language penalty involved.
 
 Fan-out across platforms falls out for free: each `actual` node emits its own `UnresolvedRef`, independently resolved to the same `expect` target, producing N `ActualFor` edges converging on one node.
+
+### Post-resolution population of `kmp_declarations` (`tokensave/indexing.rs`)
+
+After `resolve_all` + `create_edges` (the resolver runs at `indexing.rs:370`/`:695`/`:991`), add a pass that fills the side table purely from the freshly created `ActualFor` edges — this is what makes role/source-set queryable without any struct threading:
+
+```
+for each ActualFor edge (source = actual_id, target = expect_id):
+    for (node_id, role) in [(actual_id, "actual"), (expect_id, "expect")]:
+        let loc = kmp_location_from_path(file_path_of(node_id))  // via node map
+        upsert kmp_declarations(node_id, loc.source_set, loc.module_root, role)
+```
+
+`file_path_of` comes from the `all_nodes` slice already in scope for the resolver. Use `INSERT OR REPLACE` so re-indexing a file is idempotent. A new `Database::insert_kmp_declarations(&[KmpDeclaration])` wraps the write (mirrors `insert_unresolved_refs`, `indexing.rs:660`).
 
 ## Phase 2 — AI Context Cross-Target
 
@@ -128,37 +154,29 @@ Default BFS is proximity-bound (`traversal_depth`, `max_nodes`), but a sibling `
 fn complete_kmp_families(subgraph: &mut Subgraph, db: &Database) -> Result<()>
 ```
 
-Called after `expand_subgraph`'s existing trim/edge-recovery step. For every node in the subgraph with `kmp_role.is_some()`, query the DB for all `ActualFor` edges where the node is source or target, and add any missing counterpart nodes/edges — bypassing `max_nodes` for this addition (bounded in practice to the number of KMP targets in the project, typically 2–5).
+Called after `expand_subgraph`'s existing trim/edge-recovery step. It queries `kmp_declarations` for the subgraph's node IDs (`SELECT node_id, role FROM kmp_declarations WHERE node_id IN (...)`) to find which nodes are KMP declarations; for each, it queries the DB for all `ActualFor` edges where the node is source or target, and adds any missing counterpart nodes/edges — bypassing `max_nodes` for this addition (bounded in practice to the number of KMP targets, typically 2–5). Because role lives in `kmp_declarations` (not on `Node`), this pass needs no node-struct field.
 
 ### Formatter (`context/formatter.rs`)
 
-Target header format (current code-block header is `#### {label} ({file}:{line})`, `formatter.rs:143`), with a KMP label inserted when the node has a `kmp_role`:
+Target header format (current code-block header is `#### {label} ({file}:{line})`, `formatter.rs:143`), with a KMP label inserted when the block's node is a KMP declaration:
 
 ```
 #### foo [expect · commonMain] (shared/src/commonMain/kotlin/Foo.kt:12)
 #### foo [actual · iosMain] (shared/src/iosMain/kotlin/Foo.kt:8)
 ```
 
-**Structural gap to resolve first.** The formatter cannot see `kmp_role`/`source_set` today:
+**Where the label data comes from (no `Node`/`ExtractionResult` change).** The `source_set` is always derivable from `block.file_path` via `kmp_location_from_path`. The `role` comes from `kmp_declarations`. The current header `label` is resolved by looking `block.node_id` up **only against `context.entry_points`** — a sibling `actual` pulled in by the completion pass usually isn't an entry point, so that lookup misses it. Fix by threading a small lookup the builder already has the data for:
 
-- `CodeBlock` (`types.rs:635`) carries only `node_id: Option<String>` — not the node's fields.
-- The header `label` is currently resolved by looking `block.node_id` up **only against `context.entry_points`** (falling back to the raw node_id). A sibling `actual` pulled in by the Phase 2 completion pass is usually **not** an entry point, so this lookup wouldn't find it at all.
+- Extend the in-memory `TaskContext` the builder passes to the formatter with a `kmp_labels: HashMap<String /*node_id*/, (String /*role*/, String /*source_set*/)>`, populated in `context/builder.rs` from the `kmp_declarations` rows fetched by `complete_kmp_families` (role) plus `kmp_location_from_path` on each block's path (source_set). The formatter reads `context.kmp_labels.get(node_id)` when emitting the header. This touches only the context-layer `TaskContext` type (a builder-owned struct, not the shared `Node`/`ExtractionResult`/`CodeBlock` extractor structs) and the formatter — no extractor or DB-schema churn.
 
-Pick one of two mechanisms (decide in the implementation plan):
-
-1. **Extend `CodeBlock`** with `kmp_role: Option<String>` and `source_set: Option<String>`, populated where code blocks are built (`context/builder.rs`), so the formatter reads them directly. Simpler formatter, small struct/serialization change.
-2. **Pass a `node_id → &Node` map covering the whole subgraph** (not just entry_points) into `format_context_as_markdown`, and look up role/source_set there. No struct change, but a new formatter parameter.
-
-Recommendation: option 1 (keeps the formatter a pure function of its inputs; the builder already has the `Node` in hand when it creates each block).
-
-Also update **`format_context_as_json`** (`formatter.rs:173`) so the same `kmp_role`/`source_set` surface in JSON output — otherwise the two output formats disagree on what they expose.
+Also emit the same `role`/`source_set` in **`format_context_as_json`** (`formatter.rs:173`) so the two output formats agree on what they expose.
 
 ## Testing
 
 Following existing project conventions (`docs/MORE-LANGUAGES-SUPPORT.md` fixture + extraction test pattern):
 
 - **Phase 0:** unit tests for `kmp_location_from_path` covering standard source sets (`commonMain`, `androidMain`, `iosMain`, `jvmMain`, `commonTest`, etc.), non-KMP layouts (returns `None`), and module-root extraction with nested paths.
-- **Phase 1:** fixture project with a shared module containing `expect fun`/`actual fun`, `expect class`/`actual class` across `commonMain` + 2 platform source sets; extraction test asserts `kmp_role` is set correctly; resolver test asserts `ActualFor` edges are created with correct fan-in, and that same-named declarations in an unrelated module (different `kmp_module_root`) do NOT get linked.
+- **Phase 1:** fixture project with a shared module containing `expect fun`/`actual fun`, `expect class`/`actual class` across `commonMain` + 2 platform source sets. Extraction test asserts each `actual` decl emits an `ActualFor` unresolved ref. Resolver test asserts `ActualFor` edges are created (source = actual, target = the `commonMain` expect) with correct fan-in (N actuals → 1 expect), and that same-named declarations in an unrelated module (different `module_root`) do NOT get linked. Post-resolution test asserts `kmp_declarations` rows exist with correct `role`/`source_set`/`module_root`.
 - **Phase 2:** context-builder test asserts that querying context for one `actual` pulls in the `expect` and sibling `actual`s even under a tight `max_nodes`/`traversal_depth`; formatter test asserts the `[role · source_set]` label appears.
 
 ## Out of Scope
