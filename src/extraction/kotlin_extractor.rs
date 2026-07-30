@@ -420,6 +420,7 @@ impl KotlinExtractor {
             parent_id: None,
         };
         state.nodes.push(graph_node);
+        Self::maybe_emit_actual_for_ref(state, node);
 
         if let Some(parent_id) = state.parent_node_id() {
             state.edges.push(Edge {
@@ -486,6 +487,7 @@ impl KotlinExtractor {
             parent_id: None,
         };
         state.nodes.push(graph_node);
+        Self::maybe_emit_actual_for_ref(state, node);
 
         if let Some(parent_id) = state.parent_node_id() {
             state.edges.push(Edge {
@@ -552,6 +554,7 @@ impl KotlinExtractor {
             parent_id: None,
         };
         state.nodes.push(graph_node);
+        Self::maybe_emit_actual_for_ref(state, node);
 
         if let Some(parent_id) = state.parent_node_id() {
             state.edges.push(Edge {
@@ -831,6 +834,7 @@ impl KotlinExtractor {
             parent_id: None,
         };
         state.nodes.push(graph_node);
+        Self::maybe_emit_actual_for_ref(state, node);
 
         if let Some(parent_id) = state.parent_node_id() {
             state.edges.push(Edge {
@@ -1007,6 +1011,7 @@ impl KotlinExtractor {
             parent_id: None,
         };
         state.nodes.push(graph_node);
+        Self::maybe_emit_actual_for_ref(state, node);
 
         if let Some(parent_id) = state.parent_node_id() {
             state.edges.push(Edge {
@@ -1104,6 +1109,7 @@ impl KotlinExtractor {
             parent_id: None,
         };
         state.nodes.push(graph_node);
+        Self::maybe_emit_actual_for_ref(state, node);
 
         if let Some(parent_id) = state.parent_node_id() {
             state.edges.push(Edge {
@@ -1277,6 +1283,30 @@ impl KotlinExtractor {
         }
         // Kotlin default visibility is public.
         Visibility::Pub
+    }
+
+    /// If `node` carries the `actual` KMP modifier, emits an `ActualFor`
+    /// unresolved ref from the node most recently pushed onto `state.nodes`
+    /// (the node just built for `node`) to its `expect` counterpart. The
+    /// resolver later matches it by qualified name + KMP module root
+    /// (`resolution::resolver::try_kmp_actual_match`). `expect` declarations
+    /// need no marking here — they are discovered as the *target* of this
+    /// edge once resolved.
+    fn maybe_emit_actual_for_ref(state: &mut ExtractionState, node: TsNode<'_>) {
+        if !Self::has_modifier_keyword(node, state, "actual") {
+            return;
+        }
+        let Some(last) = state.nodes.last() else {
+            return;
+        };
+        state.unresolved_refs.push(UnresolvedRef {
+            from_node_id: last.id.clone(),
+            reference_name: last.qualified_name.clone(),
+            reference_kind: EdgeKind::ActualFor,
+            line: last.start_line,
+            column: last.start_column,
+            file_path: last.file_path.clone(),
+        });
     }
 
     /// Check if a node has a specific modifier keyword (e.g. "data", "sealed", "suspend").

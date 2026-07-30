@@ -582,3 +582,94 @@ fn probe_expect_actual_parses_without_errors() {
             .collect::<Vec<_>>()
     );
 }
+
+// -----------------------------------------------------------------------
+// ActualFor ref emission (#KMP Task 1.3)
+// -----------------------------------------------------------------------
+
+#[test]
+fn actual_fun_emits_actual_for_ref() {
+    let src = "package com.x\nactual fun platformName(): String = \"android\"\n";
+    let result = KotlinExtractor.extract("shared/src/androidMain/kotlin/P.kt", src);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let fun_node = result
+        .nodes
+        .iter()
+        .find(|n| n.name == "platformName")
+        .unwrap();
+    let refs: Vec<_> = result
+        .unresolved_refs
+        .iter()
+        .filter(|r| r.reference_kind == EdgeKind::ActualFor)
+        .collect();
+    assert_eq!(refs.len(), 1, "expected one ActualFor ref, got {:?}", refs);
+    assert_eq!(refs[0].from_node_id, fun_node.id);
+    assert_eq!(refs[0].reference_name, fun_node.qualified_name);
+}
+
+#[test]
+fn expect_fun_emits_no_actual_for_ref() {
+    let src = "package com.x\nexpect fun platformName(): String\n";
+    let result = KotlinExtractor.extract("shared/src/commonMain/kotlin/P.kt", src);
+    assert!(
+        result
+            .unresolved_refs
+            .iter()
+            .all(|r| r.reference_kind != EdgeKind::ActualFor),
+        "expect must not emit ActualFor refs"
+    );
+}
+
+#[test]
+fn plain_fun_emits_no_actual_for_ref() {
+    let src = "package com.x\nfun plain(): String = \"x\"\n";
+    let result = KotlinExtractor.extract("shared/src/commonMain/kotlin/P.kt", src);
+    assert!(result
+        .unresolved_refs
+        .iter()
+        .all(|r| r.reference_kind != EdgeKind::ActualFor));
+}
+
+#[test]
+fn actual_class_emits_actual_for_ref() {
+    let src = "actual class Platform {\n    actual val name: String = \"android\"\n}\n";
+    let result = KotlinExtractor.extract("shared/src/androidMain/kotlin/P.kt", src);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let class_node = result.nodes.iter().find(|n| n.name == "Platform").unwrap();
+    let prop_node = result.nodes.iter().find(|n| n.name == "name").unwrap();
+
+    let class_refs: Vec<_> = result
+        .unresolved_refs
+        .iter()
+        .filter(|r| r.reference_kind == EdgeKind::ActualFor && r.from_node_id == class_node.id)
+        .collect();
+    assert_eq!(class_refs.len(), 1, "class: {:?}", class_refs);
+
+    let prop_refs: Vec<_> = result
+        .unresolved_refs
+        .iter()
+        .filter(|r| r.reference_kind == EdgeKind::ActualFor && r.from_node_id == prop_node.id)
+        .collect();
+    assert_eq!(prop_refs.len(), 1, "property: {:?}", prop_refs);
+}
+
+#[test]
+fn actual_object_emits_actual_for_ref() {
+    let src = "actual object Platform {\n    actual fun name(): String = \"android\"\n}\n";
+    let result = KotlinExtractor.extract("shared/src/androidMain/kotlin/P.kt", src);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let obj_node = result
+        .nodes
+        .iter()
+        .find(|n| n.name == "Platform" && matches!(n.kind, NodeKind::KotlinObject))
+        .unwrap();
+    let refs: Vec<_> = result
+        .unresolved_refs
+        .iter()
+        .filter(|r| r.reference_kind == EdgeKind::ActualFor && r.from_node_id == obj_node.id)
+        .collect();
+    assert_eq!(refs.len(), 1, "object: {:?}", refs);
+}
