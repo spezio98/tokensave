@@ -258,6 +258,8 @@ pub enum EdgeKind {
     Receives,
     /// A documentation file describes a source file (#154).
     Documents,
+    /// Links an `actual` KMP declaration to its `expect` counterpart.
+    ActualFor,
 }
 
 #[allow(clippy::should_implement_trait)]
@@ -276,6 +278,7 @@ impl EdgeKind {
             EdgeKind::Annotates => "annotates",
             EdgeKind::Receives => "receives",
             EdgeKind::Documents => "documents",
+            EdgeKind::ActualFor => "actual_for",
         }
     }
 
@@ -293,6 +296,7 @@ impl EdgeKind {
             "annotates" => Some(EdgeKind::Annotates),
             "receives" => Some(EdgeKind::Receives),
             "documents" => Some(EdgeKind::Documents),
+            "actual_for" => Some(EdgeKind::ActualFor),
             _ => None,
         }
     }
@@ -752,4 +756,15 @@ pub struct CostTurn {
     pub cost_usd: f64,
     pub category: String,
     pub tool_names: String,
+}
+
+#[cfg(test)]
+mod edge_kind_tests {
+    use super::EdgeKind;
+
+    #[test]
+    fn actual_for_round_trips() {
+        assert_eq!(EdgeKind::ActualFor.as_str(), "actual_for");
+        assert_eq!(EdgeKind::from_str("actual_for"), Some(EdgeKind::ActualFor));
+    }
 }
