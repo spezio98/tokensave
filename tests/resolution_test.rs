@@ -1130,3 +1130,122 @@ async fn actual_for_links_to_common_expect() {
         "decoy in other module linked across modules"
     );
 }
+
+// -----------------------------------------------------------------------
+// KMP actual typealias kind-compatibility (#KMP typealias support Task 2)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn actual_typealias_links_to_expect_class() {
+    let dir = TempDir::new().unwrap();
+    let (db, _) = Database::initialize(&dir.path().join("t.db"))
+        .await
+        .unwrap();
+
+    let mk = |file: &str, kind: NodeKind| Node {
+        id: generate_node_id(file, &kind, "Platform", 1),
+        kind,
+        name: "Platform".into(),
+        qualified_name: format!("{file}::{file}::Platform"),
+        file_path: file.into(),
+        start_line: 1,
+        attrs_start_line: 1,
+        end_line: 2,
+        start_column: 0,
+        end_column: 1,
+        signature: None,
+        docstring: None,
+        visibility: Visibility::Pub,
+        is_async: false,
+        branches: 0,
+        loops: 0,
+        returns: 0,
+        max_nesting: 0,
+        unsafe_blocks: 0,
+        unchecked_calls: 0,
+        assertions: 0,
+        cognitive_complexity: 0,
+        distinct_operators: 0,
+        distinct_operands: 0,
+        total_operators: 0,
+        total_operands: 0,
+        updated_at: 0,
+        parent_id: None,
+    };
+    let expect_class = mk("shared/src/commonMain/kotlin/P.kt", NodeKind::Class);
+    let actual_alias = mk("shared/src/androidMain/kotlin/P.kt", NodeKind::TypeAlias);
+
+    let nodes = vec![expect_class.clone(), actual_alias.clone()];
+    let resolver = ReferenceResolver::from_nodes(&db, &nodes);
+
+    let uref = UnresolvedRef {
+        from_node_id: actual_alias.id.clone(),
+        reference_name: "Platform".into(),
+        reference_kind: EdgeKind::ActualFor,
+        line: 1,
+        column: 0,
+        file_path: actual_alias.file_path.clone(),
+    };
+    let resolved = resolver
+        .resolve_one(&uref)
+        .expect("actual typealias should resolve to expect class");
+    assert_eq!(resolved.target_node_id, expect_class.id);
+}
+
+#[tokio::test]
+async fn actual_typealias_does_not_link_to_expect_function() {
+    let dir = TempDir::new().unwrap();
+    let (db, _) = Database::initialize(&dir.path().join("t.db"))
+        .await
+        .unwrap();
+
+    let mk = |file: &str, kind: NodeKind| Node {
+        id: generate_node_id(file, &kind, "Platform", 1),
+        kind,
+        name: "Platform".into(),
+        qualified_name: format!("{file}::{file}::Platform"),
+        file_path: file.into(),
+        start_line: 1,
+        attrs_start_line: 1,
+        end_line: 2,
+        start_column: 0,
+        end_column: 1,
+        signature: None,
+        docstring: None,
+        visibility: Visibility::Pub,
+        is_async: false,
+        branches: 0,
+        loops: 0,
+        returns: 0,
+        max_nesting: 0,
+        unsafe_blocks: 0,
+        unchecked_calls: 0,
+        assertions: 0,
+        cognitive_complexity: 0,
+        distinct_operators: 0,
+        distinct_operands: 0,
+        total_operators: 0,
+        total_operands: 0,
+        updated_at: 0,
+        parent_id: None,
+    };
+    // A same-named `expect fun` must NOT be treated as this typealias's counterpart.
+    let expect_fn = mk("shared/src/commonMain/kotlin/P.kt", NodeKind::Function);
+    let actual_alias = mk("shared/src/androidMain/kotlin/P.kt", NodeKind::TypeAlias);
+
+    let nodes = vec![expect_fn.clone(), actual_alias.clone()];
+    let resolver = ReferenceResolver::from_nodes(&db, &nodes);
+
+    let uref = UnresolvedRef {
+        from_node_id: actual_alias.id.clone(),
+        reference_name: "Platform".into(),
+        reference_kind: EdgeKind::ActualFor,
+        line: 1,
+        column: 0,
+        file_path: actual_alias.file_path.clone(),
+    };
+    assert!(
+        resolver.resolve_one(&uref).is_none(),
+        "actual typealias must not link to an expect function"
+    );
+}

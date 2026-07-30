@@ -201,6 +201,35 @@ fn kmp_logical_path(node: &Node) -> &str {
         .unwrap_or(&node.qualified_name)
 }
 
+/// True if `a`/`b` are the same `NodeKind`, or one is `TypeAlias` and the
+/// other is a Kotlin type-declaration kind. An `actual typealias` can
+/// satisfy `expect class`/`interface`/`object` (a real Kotlin language
+/// rule), but never `expect fun`/`expect val` — those always require a
+/// real `actual fun`/`actual val`.
+fn kmp_kind_compatible(a: &NodeKind, b: &NodeKind) -> bool {
+    const TYPE_DECL_KINDS: &[NodeKind] = &[
+        NodeKind::Class,
+        NodeKind::InnerClass,
+        NodeKind::SealedClass,
+        NodeKind::DataClass,
+        NodeKind::Trait, // Kotlin `interface` extracts as Trait
+        NodeKind::KotlinObject,
+        NodeKind::CompanionObject,
+        NodeKind::Enum,
+    ];
+    if a == b {
+        return true;
+    }
+    let other = if *a == NodeKind::TypeAlias {
+        b
+    } else if *b == NodeKind::TypeAlias {
+        a
+    } else {
+        return false;
+    };
+    TYPE_DECL_KINDS.contains(other)
+}
+
 /// Infer a coarse language tag from a file path extension.
 fn lang_from_path(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
@@ -695,7 +724,7 @@ impl<'a> ReferenceResolver<'a> {
             .iter()
             .copied()
             .filter(|n| n.id != source.id)
-            .filter(|n| n.kind == source.kind)
+            .filter(|n| kmp_kind_compatible(&n.kind, &source.kind))
             .filter(|n| kmp_logical_path(n) == src_logical_path)
             .filter_map(|n| kmp_location_from_path(&n.file_path).map(|loc| (n, loc)))
             .filter(|(_, loc)| loc.module_root == src_loc.module_root)
