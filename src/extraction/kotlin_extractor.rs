@@ -1288,10 +1288,17 @@ impl KotlinExtractor {
     /// If `node` carries the `actual` KMP modifier, emits an `ActualFor`
     /// unresolved ref from the node most recently pushed onto `state.nodes`
     /// (the node just built for `node`) to its `expect` counterpart. The
-    /// resolver later matches it by qualified name + KMP module root
-    /// (`resolution::resolver::try_kmp_actual_match`). `expect` declarations
-    /// need no marking here — they are discovered as the *target* of this
-    /// edge once resolved.
+    /// resolver later matches it by bare name + nesting path + KMP module
+    /// root (`resolution::resolver::try_kmp_actual_match`). `expect`
+    /// declarations need no marking here — they are discovered as the
+    /// *target* of this edge once resolved.
+    ///
+    /// `reference_name` is the declaration's bare `name` (e.g.
+    /// `"platformName"`), not its `qualified_name` — this extractor's
+    /// qualified names are file-scoped (prefixed by `file_path`), so an
+    /// `expect` and its `actual`s, always living in different files, never
+    /// share one. The bare name is what they do share, and is what the
+    /// resolver's `name_cache` is keyed on.
     fn maybe_emit_actual_for_ref(state: &mut ExtractionState, node: TsNode<'_>) {
         if !Self::has_modifier_keyword(node, state, "actual") {
             return;
@@ -1301,7 +1308,7 @@ impl KotlinExtractor {
         };
         state.unresolved_refs.push(UnresolvedRef {
             from_node_id: last.id.clone(),
-            reference_name: last.qualified_name.clone(),
+            reference_name: last.name.clone(),
             reference_kind: EdgeKind::ActualFor,
             line: last.start_line,
             column: last.start_column,

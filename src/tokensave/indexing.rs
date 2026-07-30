@@ -166,6 +166,46 @@ fn reenters_project_root(path: &Path, canonical_root: Option<&Path>) -> bool {
 // ---------------------------------------------------------------------------
 
 impl TokenSave {
+    /// Fills `kmp_declarations` from freshly-created `ActualFor` edges. Roles
+    /// are derived from edge direction (source = actual, target = expect);
+    /// source-set/module-root are derived from each node's path via
+    /// `kmp_location_from_path`. Idempotent — safe to call after every
+    /// resolution pass, full or incremental.
+    async fn populate_kmp_declarations(&self, edges: &[Edge], nodes: &[Node]) -> Result<()> {
+        use crate::extraction::kmp::kmp_location_from_path;
+
+        let path_of: HashMap<&str, &str> = nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.file_path.as_str()))
+            .collect();
+
+        let mut decls: Vec<KmpDeclaration> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for e in edges.iter().filter(|e| e.kind == EdgeKind::ActualFor) {
+            for (node_id, role) in [(&e.source, "actual"), (&e.target, "expect")] {
+                if !seen.insert(node_id.clone()) {
+                    continue;
+                }
+                let Some(path) = path_of.get(node_id.as_str()) else {
+                    continue;
+                };
+                let Some(loc) = kmp_location_from_path(path) else {
+                    continue;
+                };
+                decls.push(KmpDeclaration {
+                    node_id: node_id.clone(),
+                    source_set: loc.source_set,
+                    module_root: loc.module_root,
+                    role: role.to_string(),
+                });
+            }
+        }
+        if !decls.is_empty() {
+            self.db.insert_kmp_declarations(&decls).await?;
+        }
+        Ok(())
+    }
+
     /// Builds `Doc` nodes and `Documents` edges for companion documentation.
     ///
     /// Discovery uses the already-extracted node set as the source of truth for
@@ -407,6 +447,8 @@ impl TokenSave {
             .insert_executable_body_documents(&body_documents)
             .await?;
         self.db.insert_edges(&all_edges).await?;
+        self.populate_kmp_declarations(&all_edges, &all_nodes)
+            .await?;
         self.db.upsert_files(&file_records).await?;
 
         // Durably record every raw unresolved reference extracted this pass —
@@ -700,6 +742,7 @@ impl TokenSave {
                 let edges = resolver.create_edges(&resolution.resolved);
                 if !edges.is_empty() {
                     self.db.insert_edges(&edges).await?;
+                    self.populate_kmp_declarations(&edges, &all_nodes).await?;
                     // Re-propagate build-variant call edges over the full graph
                     // now that new call edges exist (#141).
                     let all_db_edges = self.db.get_all_edges().await.unwrap_or_default();
@@ -994,6 +1037,7 @@ impl TokenSave {
                 let edges = resolver.create_edges(&resolution.resolved);
                 if !edges.is_empty() {
                     self.db.insert_edges(&edges).await?;
+                    self.populate_kmp_declarations(&edges, &all_nodes).await?;
                     // Propagate call edges across build-config variants (#141).
                     let all_db_edges = self.db.get_all_edges().await.unwrap_or_default();
                     let variant_edges =

@@ -605,7 +605,7 @@ fn actual_fun_emits_actual_for_ref() {
         .collect();
     assert_eq!(refs.len(), 1, "expected one ActualFor ref, got {:?}", refs);
     assert_eq!(refs[0].from_node_id, fun_node.id);
-    assert_eq!(refs[0].reference_name, fun_node.qualified_name);
+    assert_eq!(refs[0].reference_name, fun_node.name);
 }
 
 #[test]

@@ -1063,11 +1063,14 @@ async fn actual_for_links_to_common_expect() {
         .await
         .unwrap();
 
+    // Mirrors KotlinExtractor's real (file-scoped) qualified_name shape:
+    // file_path::file_path::name -- expect/actual never share this string,
+    // only the bare `name` (see kmp_logical_path / try_kmp_actual_match).
     let mk = |file: &str| Node {
         id: generate_node_id(file, &NodeKind::Function, "platformName", 1),
         kind: NodeKind::Function,
         name: "platformName".into(),
-        qualified_name: "com.x::platformName".into(),
+        qualified_name: format!("{file}::{file}::platformName"),
         file_path: file.into(),
         start_line: 1,
         attrs_start_line: 1,
@@ -1103,7 +1106,7 @@ async fn actual_for_links_to_common_expect() {
 
     let mk_ref = |n: &Node| UnresolvedRef {
         from_node_id: n.id.clone(),
-        reference_name: "com.x::platformName".into(),
+        reference_name: "platformName".into(),
         reference_kind: EdgeKind::ActualFor,
         line: 1,
         column: 0,

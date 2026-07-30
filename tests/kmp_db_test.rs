@@ -55,7 +55,9 @@ async fn insert_is_idempotent() {
         module_root: "shared".into(),
         role: "actual".into(),
     };
-    db.insert_kmp_declarations(&[d.clone()]).await.unwrap();
+    db.insert_kmp_declarations(std::slice::from_ref(&d))
+        .await
+        .unwrap();
     db.insert_kmp_declarations(&[d]).await.unwrap();
     let got = db
         .get_kmp_declarations_for(&["a".to_string()])

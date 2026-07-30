@@ -66,6 +66,7 @@ pub fn kmp_location_from_path(file_path: &str) -> Option<KmpLocation> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
