@@ -183,6 +183,24 @@ fn suppress_go_selector_bare_siblings(resolved: &mut Vec<ResolvedRef>) {
     });
 }
 
+/// Strips the file-scoping prefix from a Kotlin node's `qualified_name`,
+/// leaving just its nesting path (e.g. `"Platform::name"`, or `"platformName"`
+/// for a top-level declaration).
+///
+/// `KotlinExtractor` builds `qualified_name` as `file_path::file_path::<rest>`
+/// (`qualified_prefix()` prepends `file_path`, and the node stack it walks
+/// always starts with a `(file_path, _)` entry pushed once per file) — so an
+/// `expect` and its `actual`s, which live in different files, never share a
+/// `qualified_name`. Splitting off the first two `::`-segments recovers the
+/// part that *is* shared: the declaration's nesting path + name. Safe because
+/// file paths never contain `::`.
+fn kmp_logical_path(node: &Node) -> &str {
+    node.qualified_name
+        .splitn(3, "::")
+        .nth(2)
+        .unwrap_or(&node.qualified_name)
+}
+
 /// Infer a coarse language tag from a file path extension.
 fn lang_from_path(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
@@ -397,6 +415,16 @@ impl<'a> ReferenceResolver<'a> {
     ///
     /// Returns `None` if no strategy can resolve the reference.
     pub fn resolve_one(&self, uref: &UnresolvedRef) -> Option<ResolvedRef> {
+        // KMP expect/actual linking: dispatched on `reference_kind`, not name
+        // shape, and must run before Strategy 1 below. Kotlin qualified names
+        // use `::`, so an `ActualFor` ref would otherwise fall into the
+        // qualified-name strategy — but the `expect` and every `actual` share
+        // the *same* qualified name, so that strategy can't disambiguate them
+        // (it could even match the actual to itself).
+        if uref.reference_kind == EdgeKind::ActualFor {
+            return self.try_kmp_actual_match(uref);
+        }
+
         // Skip `Uses` edges whose reference name is a stdlib, external crate,
         // or wildcard import path. These create false cross-file edges when
         // two files both `use std::path::Path` — the resolver matches the name
@@ -640,6 +668,64 @@ impl<'a> ReferenceResolver<'a> {
             });
         }
         None
+    }
+
+    /// KMP `expect`/`actual` resolution: link an `actual` declaration to its
+    /// `expect` counterpart. The `expect` and every `actual` share the same
+    /// bare *name* (Kotlin requires it), but NOT the same `qualified_name` —
+    /// this extractor's qualified names are file-scoped (prefixed by
+    /// `file_path`), and `expect`/`actual` always live in different files.
+    /// So this strategy fans out from `name_cache` (keyed on bare name) and
+    /// narrows by nesting path (`kmp_logical_path`, which strips the file
+    /// scoping) + module root + node kind, picking the `Common`-source-set
+    /// declaration as the `expect`.
+    fn try_kmp_actual_match(&self, uref: &UnresolvedRef) -> Option<ResolvedRef> {
+        use crate::extraction::kmp::{kmp_location_from_path, KmpTarget};
+
+        let candidates = self.name_cache.get(uref.reference_name.as_str())?;
+        // The source (actual) node is itself in this bucket (same bare name).
+        let source = candidates
+            .iter()
+            .copied()
+            .find(|n| n.id == uref.from_node_id)?;
+        let src_loc = kmp_location_from_path(&source.file_path)?;
+        let src_logical_path = kmp_logical_path(source);
+
+        let matched: Vec<&Node> = candidates
+            .iter()
+            .copied()
+            .filter(|n| n.id != source.id)
+            .filter(|n| n.kind == source.kind)
+            .filter(|n| kmp_logical_path(n) == src_logical_path)
+            .filter_map(|n| kmp_location_from_path(&n.file_path).map(|loc| (n, loc)))
+            .filter(|(_, loc)| loc.module_root == src_loc.module_root)
+            .filter(|(_, loc)| loc.source_set != src_loc.source_set)
+            .map(|(n, _)| n)
+            .collect();
+
+        // Prefer the Common-source-set declaration (the canonical `expect`);
+        // fall back to the sole remaining candidate if none is Common.
+        let expect = matched
+            .iter()
+            .copied()
+            .find(|n| {
+                kmp_location_from_path(&n.file_path)
+                    .is_some_and(|loc| loc.target == KmpTarget::Common)
+            })
+            .or_else(|| {
+                if matched.len() == 1 {
+                    matched.first().copied()
+                } else {
+                    None
+                }
+            })?;
+
+        Some(ResolvedRef {
+            original: uref.clone(),
+            target_node_id: expect.id.clone(),
+            confidence: 0.95,
+            resolved_by: "kmp-actual".to_string(),
+        })
     }
 
     /// Strategy 2: exact name match using the name cache.

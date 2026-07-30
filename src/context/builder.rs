@@ -42,14 +42,24 @@ impl<'a> ContextBuilder<'a> {
         // Step 1-3: find relevant subgraph and entry points
         let symbols = extract_symbols_from_query(query);
         let entry_points = self.find_entry_points(query, &symbols, options).await?;
-        let subgraph = self.expand_subgraph(&entry_points, options).await?;
+        let mut subgraph = self.expand_subgraph(&entry_points, options).await?;
+        let kmp_extra_nodes = self.complete_kmp_families(&mut subgraph).await?;
+        let kmp_labels = self.build_kmp_labels(&subgraph).await?;
 
-        // Step 4: extract code blocks from source files
+        // Step 4: extract code blocks from source files. Includes any KMP
+        // family members pulled in above (e.g. a sibling platform actual)
+        // even though they aren't search entry points, so the AI reads their
+        // code, not just their file:line in the related-symbols list.
         let code_blocks = if options.include_code {
             // Share one file-content cache across extract + merge so each
             // source file is read at most once for this request.
             let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
-            let blocks = self.extract_code_blocks(&entry_points, options, &mut file_cache);
+            let code_nodes: Vec<Node> = entry_points
+                .iter()
+                .cloned()
+                .chain(kmp_extra_nodes.iter().cloned())
+                .collect();
+            let blocks = self.extract_code_blocks(&code_nodes, options, &mut file_cache);
             if options.merge_adjacent {
                 self.merge_adjacent_blocks(blocks, &mut file_cache)
             } else {
@@ -75,7 +85,24 @@ impl<'a> ContextBuilder<'a> {
             code_blocks,
             related_files,
             seen_node_ids,
+            kmp_labels,
         })
+    }
+
+    /// Builds the `node_id -> (role, source_set)` KMP label map for every
+    /// node in `subgraph` that is an `expect`/`actual` declaration, so the
+    /// formatter can tag code blocks with their platform without needing a
+    /// `Node`-struct field.
+    async fn build_kmp_labels(
+        &self,
+        subgraph: &Subgraph,
+    ) -> Result<HashMap<String, (String, String)>> {
+        let ids: Vec<String> = subgraph.nodes.iter().map(|n| n.id.clone()).collect();
+        let decls = self.db.get_kmp_declarations_for(&ids).await?;
+        Ok(decls
+            .into_iter()
+            .map(|d| (d.node_id, (d.role, d.source_set)))
+            .collect())
     }
 
     /// Finds the relevant subgraph for a query without extracting code blocks.
@@ -89,7 +116,9 @@ impl<'a> ContextBuilder<'a> {
     ) -> Result<Subgraph> {
         let symbols = extract_symbols_from_query(query);
         let entry_points = self.find_entry_points(query, &symbols, options).await?;
-        self.expand_subgraph(&entry_points, options).await
+        let mut subgraph = self.expand_subgraph(&entry_points, options).await?;
+        self.complete_kmp_families(&mut subgraph).await?;
+        Ok(subgraph)
     }
 
     /// Reads the source file and extracts the code for a node.
@@ -691,6 +720,61 @@ impl<'a> ContextBuilder<'a> {
             edges: all_edges,
             roots: all_roots,
         })
+    }
+
+    /// Guarantees KMP family completeness: for any node in `subgraph` that is
+    /// an `expect`/`actual` declaration, pulls in every counterpart reachable
+    /// via `ActualFor` edges, bypassing `max_nodes`/`traversal_depth` for this
+    /// addition — a platform family is tiny (one node per KMP target), and a
+    /// sibling missed here would leave the AI seeing e.g. the Android
+    /// implementation without knowing an iOS one exists.
+    ///
+    /// Returns the newly-added nodes so callers can also fetch their code
+    /// (they're not necessarily entry points).
+    async fn complete_kmp_families(&self, subgraph: &mut Subgraph) -> Result<Vec<Node>> {
+        let ids: Vec<String> = subgraph.nodes.iter().map(|n| n.id.clone()).collect();
+        let decls = self.db.get_kmp_declarations_for(&ids).await?;
+        if decls.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut present: HashSet<String> = ids.into_iter().collect();
+        let mut present_edges: HashSet<(String, String, &'static str)> = subgraph
+            .edges
+            .iter()
+            .map(|e| (e.source.clone(), e.target.clone(), e.kind.as_str()))
+            .collect();
+        let mut added_nodes: Vec<Node> = Vec::new();
+
+        // Fixed-point walk over ActualFor edges, not a single pass: an
+        // `expect` discovered while processing one `actual` has its OWN
+        // incoming edges (the other actuals) that a one-shot pass over the
+        // original node set would never visit. Queue every KMP-tagged node —
+        // seed and newly-discovered alike — until nothing new turns up.
+        let mut queue: std::collections::VecDeque<String> =
+            decls.iter().map(|d| d.node_id.clone()).collect();
+        let mut queued: HashSet<String> = queue.iter().cloned().collect();
+
+        while let Some(node_id) = queue.pop_front() {
+            for edge in self.db.get_actual_for_edges_for(&node_id).await? {
+                for counterpart in [&edge.source, &edge.target] {
+                    if present.insert(counterpart.clone()) {
+                        if let Some(node) = self.db.get_node_by_id(counterpart).await? {
+                            added_nodes.push(node.clone());
+                            subgraph.nodes.push(node);
+                        }
+                    }
+                    if queued.insert(counterpart.clone()) {
+                        queue.push_back(counterpart.clone());
+                    }
+                }
+                let key = (edge.source.clone(), edge.target.clone(), edge.kind.as_str());
+                if present_edges.insert(key) {
+                    subgraph.edges.push(edge);
+                }
+            }
+        }
+        Ok(added_nodes)
     }
 
     /// Extracts code blocks for the entry-point nodes.

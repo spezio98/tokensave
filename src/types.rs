@@ -258,6 +258,8 @@ pub enum EdgeKind {
     Receives,
     /// A documentation file describes a source file (#154).
     Documents,
+    /// Links an `actual` KMP declaration to its `expect` counterpart.
+    ActualFor,
 }
 
 #[allow(clippy::should_implement_trait)]
@@ -276,6 +278,7 @@ impl EdgeKind {
             EdgeKind::Annotates => "annotates",
             EdgeKind::Receives => "receives",
             EdgeKind::Documents => "documents",
+            EdgeKind::ActualFor => "actual_for",
         }
     }
 
@@ -293,6 +296,7 @@ impl EdgeKind {
             "annotates" => Some(EdgeKind::Annotates),
             "receives" => Some(EdgeKind::Receives),
             "documents" => Some(EdgeKind::Documents),
+            "actual_for" => Some(EdgeKind::ActualFor),
             _ => None,
         }
     }
@@ -413,6 +417,17 @@ pub struct UnresolvedRef {
     pub line: u32,
     pub column: u32,
     pub file_path: String,
+}
+
+/// A row in the `kmp_declarations` side table: tags a node as an `expect` or
+/// `actual` KMP declaration, with its source set and owning module. Stored off
+/// to the side so no column is added to `Node`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KmpDeclaration {
+    pub node_id: String,
+    pub source_set: String,
+    pub module_root: String,
+    pub role: String, // "expect" | "actual"
 }
 
 /// Result of extracting code entities from a file.
@@ -628,6 +643,12 @@ pub struct TaskContext {
     pub related_files: Vec<String>,
     /// IDs of all nodes returned as entry points (pass to next call's `exclude_node_ids` for dedup).
     pub seen_node_ids: Vec<String>,
+    /// Maps a node id to its `(role, source_set)` KMP label (e.g. `("actual",
+    /// "iosMain")`), for nodes in `subgraph`/`code_blocks` that are `expect`/
+    /// `actual` declarations. Empty for non-KMP contexts. Not part of the
+    /// persisted graph — derived at context-build time.
+    #[serde(default)]
+    pub kmp_labels: HashMap<String, (String, String)>,
 }
 
 /// A block of source code extracted from a file.
@@ -741,4 +762,15 @@ pub struct CostTurn {
     pub cost_usd: f64,
     pub category: String,
     pub tool_names: String,
+}
+
+#[cfg(test)]
+mod edge_kind_tests {
+    use super::EdgeKind;
+
+    #[test]
+    fn actual_for_round_trips() {
+        assert_eq!(EdgeKind::ActualFor.as_str(), "actual_for");
+        assert_eq!(EdgeKind::from_str("actual_for"), Some(EdgeKind::ActualFor));
+    }
 }

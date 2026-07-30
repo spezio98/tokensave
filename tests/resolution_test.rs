@@ -1051,3 +1051,82 @@ fn test_no_fanout_without_cfg() {
         "non-cfg same-qualified-name nodes must not fan out, got: {extra:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// KMP expect/actual resolution (#KMP Task 1.4)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn actual_for_links_to_common_expect() {
+    let dir = TempDir::new().unwrap();
+    let (db, _) = Database::initialize(&dir.path().join("t.db"))
+        .await
+        .unwrap();
+
+    // Mirrors KotlinExtractor's real (file-scoped) qualified_name shape:
+    // file_path::file_path::name -- expect/actual never share this string,
+    // only the bare `name` (see kmp_logical_path / try_kmp_actual_match).
+    let mk = |file: &str| Node {
+        id: generate_node_id(file, &NodeKind::Function, "platformName", 1),
+        kind: NodeKind::Function,
+        name: "platformName".into(),
+        qualified_name: format!("{file}::{file}::platformName"),
+        file_path: file.into(),
+        start_line: 1,
+        attrs_start_line: 1,
+        end_line: 2,
+        start_column: 0,
+        end_column: 1,
+        signature: None,
+        docstring: None,
+        visibility: Visibility::Pub,
+        is_async: false,
+        branches: 0,
+        loops: 0,
+        returns: 0,
+        max_nesting: 0,
+        unsafe_blocks: 0,
+        unchecked_calls: 0,
+        assertions: 0,
+        cognitive_complexity: 0,
+        distinct_operators: 0,
+        distinct_operands: 0,
+        total_operators: 0,
+        total_operands: 0,
+        updated_at: 0,
+        parent_id: None,
+    };
+    let expect = mk("shared/src/commonMain/kotlin/P.kt");
+    let android = mk("shared/src/androidMain/kotlin/P.kt");
+    let ios = mk("shared/src/iosMain/kotlin/P.kt");
+    let decoy = mk("other/src/androidMain/kotlin/P.kt"); // different module_root
+
+    let nodes = vec![expect.clone(), android.clone(), ios.clone(), decoy.clone()];
+    let resolver = ReferenceResolver::from_nodes(&db, &nodes);
+
+    let mk_ref = |n: &Node| UnresolvedRef {
+        from_node_id: n.id.clone(),
+        reference_name: "platformName".into(),
+        reference_kind: EdgeKind::ActualFor,
+        line: 1,
+        column: 0,
+        file_path: n.file_path.clone(),
+    };
+
+    // Both real actuals resolve to the commonMain expect (fan-in).
+    let r_android = resolver
+        .resolve_one(&mk_ref(&android))
+        .expect("android resolves");
+    assert_eq!(r_android.target_node_id, expect.id);
+    let r_ios = resolver.resolve_one(&mk_ref(&ios)).expect("ios resolves");
+    assert_eq!(r_ios.target_node_id, expect.id);
+
+    // The decoy in a different module must NOT resolve to this expect.
+    let r_decoy = resolver.resolve_one(&mk_ref(&decoy));
+    assert!(
+        r_decoy
+            .as_ref()
+            .is_none_or(|r| r.target_node_id != expect.id),
+        "decoy in other module linked across modules"
+    );
+}

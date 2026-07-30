@@ -14,6 +14,7 @@ mod swift_extractor;
 mod typescript_extractor;
 
 pub mod complexity;
+pub mod kmp;
 pub mod ts_provider;
 mod ts_state;
 
