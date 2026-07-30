@@ -174,6 +174,7 @@ impl KotlinExtractor {
             "companion_object" => Self::visit_companion_object(state, node),
             "property_declaration" => Self::visit_property(state, node),
             "secondary_constructor" => Self::visit_secondary_constructor(state, node),
+            "type_alias" => Self::visit_type_alias(state, node),
             _ => {
                 // Recurse into children for any unhandled node types.
                 Self::visit_children(state, node);
@@ -1091,6 +1092,65 @@ impl KotlinExtractor {
             end_column,
             signature: Some(sig),
             docstring: Self::extract_kdoc(state, node),
+            visibility,
+            is_async: false,
+            branches: 0,
+            loops: 0,
+            returns: 0,
+            max_nesting: 0,
+            unsafe_blocks: 0,
+            unchecked_calls: 0,
+            assertions: 0,
+            cognitive_complexity: 0,
+            distinct_operators: 0,
+            distinct_operands: 0,
+            total_operators: 0,
+            total_operands: 0,
+            updated_at: state.timestamp,
+            parent_id: None,
+        };
+        state.nodes.push(graph_node);
+        Self::maybe_emit_actual_for_ref(state, node);
+
+        if let Some(parent_id) = state.parent_node_id() {
+            state.edges.push(Edge {
+                source: parent_id.to_string(),
+                target: id,
+                kind: EdgeKind::Contains,
+                line: Some(start_line),
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Typealias
+    // -----------------------------------------------------------------------
+
+    /// Extract a typealias declaration.
+    fn visit_type_alias(state: &mut ExtractionState, node: TsNode<'_>) {
+        let name = find_child_by_kind(node, "type_identifier")
+            .map_or_else(|| "<anonymous>".to_string(), |n| state.node_text(n));
+        let visibility = Self::extract_visibility(node, state);
+        let start_line = node.start_position().row as u32;
+        let end_line = node.end_position().row as u32;
+        let start_column = node.start_position().column as u32;
+        let end_column = node.end_position().column as u32;
+        let qualified_name = format!("{}::{}", state.qualified_prefix(), name);
+        let id = generate_node_id(&state.file_path, &NodeKind::TypeAlias, &name, start_line);
+
+        let graph_node = Node {
+            id: id.clone(),
+            kind: NodeKind::TypeAlias,
+            name: name.clone(),
+            qualified_name,
+            file_path: state.file_path.clone(),
+            start_line,
+            attrs_start_line: start_line,
+            end_line,
+            start_column,
+            end_column,
+            signature: Some(state.node_text(node).trim().to_string()),
+            docstring: None,
             visibility,
             is_async: false,
             branches: 0,
