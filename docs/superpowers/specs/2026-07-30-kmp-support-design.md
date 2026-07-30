@@ -81,13 +81,15 @@ Reuse the existing `has_modifier_keyword(node, state, keyword)` helper (`kotlin_
 ```rust
 state.unresolved_refs.push(UnresolvedRef {
     from_node_id: id.clone(),
-    reference_name: qualified_name.clone(),
+    reference_name: name.clone(),
     reference_kind: EdgeKind::ActualFor,
     line: start_line,
     column: start_column,
     file_path: state.file_path.clone(),
 });
 ```
+
+**`reference_name` is the bare `name` (e.g. `"platformName"`), not `qualified_name`.** This was wrong in an earlier draft of this spec, caught by the Task 1.5 end-to-end test: `KotlinExtractor`'s `qualified_name` is **file-scoped** — `qualified_prefix()` (`kotlin_extractor.rs:57`) prepends `file_path`, and the per-file node stack it walks always starts with a `(file_path, _)` entry, so a top-level declaration's `qualified_name` is literally `"{file_path}::{file_path}::{name}"`. An `expect` and its `actual`s always live in **different files**, so they never share a `qualified_name` — only the bare `name`, which Kotlin's language rules guarantee is identical. See the corresponding fix in the resolver section below.
 
 `expect` modifier is *not* checked at extraction time. This reuses the existing generic `unresolved_refs → resolve_all → create_edges` pipeline unchanged.
 
@@ -108,7 +110,7 @@ New dedicated matching strategy, following the existing `try_go_selector_match` 
 fn try_kmp_actual_match(&self, uref: &UnresolvedRef) -> Option<ResolvedRef>
 ```
 
-**Dispatch placement is critical.** `resolve_one` (`resolver.rs:399`) dispatches by the *shape* of `reference_name` (contains `::` → qualified match; contains `.` → dotted-receiver; else exact name), **not** by `reference_kind`. Kotlin qualified names use `::` (`kotlin_extractor.rs:197`), so an `ActualFor` ref whose `reference_name` is the actual's own qualified name would fall into Strategy 1 (qualified match). That is wrong: the `expect` and **all** its `actual`s share the *same* qualified name, so `qualified_name_cache` returns the whole family — the generic strategy would match ambiguously, and could even match the actual to itself.
+**Dispatch placement is critical.** `resolve_one` (`resolver.rs:399`) dispatches by the *shape* of `reference_name` (contains `::` → qualified match; contains `.` → dotted-receiver; else exact name), **not** by `reference_kind`. If the KMP ref's `reference_name` contained `::`, it would fall into Strategy 1 (qualified match) instead of the dedicated strategy below.
 
 Therefore the KMP strategy must be dispatched **on `reference_kind`, at the very top of `resolve_one`, before the `Uses`-skip block and before Strategy 1**:
 
@@ -118,11 +120,13 @@ if uref.reference_kind == EdgeKind::ActualFor {
 }
 ```
 
+**Cache choice, corrected.** `qualified_name_cache` is keyed on the file-scoped `qualified_name` — since (per the extractor section above) an `expect` and its `actual`s never share that string, looking them up there returns only the single node itself, not its counterparts. The strategy instead uses `name_cache` (keyed on the bare `name`, which Kotlin guarantees is identical across an `expect`/`actual` pair), plus a new `kmp_logical_path(node)` helper that strips the file-scoping prefix from `qualified_name` (splits on `::`, keeps everything after the first two segments) to recover just the nesting path (e.g. `"Platform::name"` or `"platformName"`) — this disambiguates same-named declarations nested in different classes within the same module, which bare-name matching alone couldn't.
+
 Inside `try_kmp_actual_match` (all fields derived on the fly — nothing is read from a stored KMP column):
 
-1. Look up the source (`actual`) node by `uref.from_node_id` in the resolver's node cache (holds full `&Node` refs, `resolver.rs:269`). Compute its location: `let src = kmp_location_from_path(&source_node.file_path)?;`.
-2. Get candidates from `qualified_name_cache[uref.reference_name]` (the `expect` and all sibling `actual`s share this qualified name).
-3. Keep only candidates where: (a) `kmp_location_from_path(candidate.file_path)` yields the **same `module_root`** as `src` (prevents cross-module false matches), (b) `candidate.kind == source_node.kind` (fun↔fun, class↔class), and (c) the candidate is the **`expect`** — identified structurally as the one whose `source_set` target is `Common` (KMP requires `expect` to live in a common source set), or, if none is `Common`, the single candidate in a source set that differs from every `actual`'s. Exclude the source node itself.
+1. Look up the source (`actual`) node by `uref.from_node_id` in the resolver's node cache (holds full `&Node` refs, `resolver.rs:269`). Compute its location: `let src = kmp_location_from_path(&source_node.file_path)?;` and `let src_path = kmp_logical_path(source_node);`.
+2. Get candidates from `name_cache[uref.reference_name]` (the bare name — `expect` and all sibling `actual`s share it).
+3. Keep only candidates where: (a) `kmp_logical_path(candidate) == src_path` (same nesting path, not just same bare name), (b) `kmp_location_from_path(candidate.file_path)` yields the **same `module_root`** as `src` (prevents cross-module false matches), (c) `candidate.kind == source_node.kind` (fun↔fun, class↔class), and (d) the candidate is the **`expect`** — identified structurally as the one whose `source_set` target is `Common` (KMP requires `expect` to live in a common source set), or, if none is `Common`, the single candidate in a source set that differs from every `actual`'s. Exclude the source node itself.
 4. Return a `ResolvedRef` to that node. This bypasses the generic scorer entirely, like `try_go_selector_match` — no cross-language penalty involved.
 
 Fan-out across platforms falls out for free: each `actual` node emits its own `UnresolvedRef`, independently resolved to the same `expect` target, producing N `ActualFor` edges converging on one node.
