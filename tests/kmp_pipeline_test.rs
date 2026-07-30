@@ -81,3 +81,56 @@ async fn actual_for_edges_and_kmp_declarations_populated() {
     assert_eq!(expect_decl.source_set, "commonMain");
     assert_eq!(expect_decl.module_root, "shared");
 }
+
+async fn setup_kmp_typealias_module() -> (TokenSave, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+
+    fs::create_dir_all(project.join("shared/src/commonMain/kotlin")).unwrap();
+    fs::create_dir_all(project.join("shared/src/androidMain/kotlin")).unwrap();
+
+    fs::write(
+        project.join("shared/src/commonMain/kotlin/Platform.kt"),
+        "package com.x\n\nexpect class Platform {\n    val name: String\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("shared/src/androidMain/kotlin/Platform.kt"),
+        "package com.x\n\nactual typealias Platform = AndroidPlatform\n",
+    )
+    .unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+    (cg, dir)
+}
+
+#[tokio::test]
+async fn actual_typealias_links_to_expect_class_end_to_end() {
+    let (cg, _dir) = setup_kmp_typealias_module().await;
+
+    let all_nodes = cg.db().get_all_nodes().await.unwrap();
+    let all_edges = cg.db().get_all_edges().await.unwrap();
+
+    let actual_for_edges: Vec<_> = all_edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::ActualFor)
+        .collect();
+    assert_eq!(
+        actual_for_edges.len(),
+        1,
+        "expected 1 ActualFor edge (androidMain typealias -> commonMain expect class), got {:?}",
+        actual_for_edges
+    );
+
+    let expect_node = all_nodes
+        .iter()
+        .find(|n| n.file_path.contains("commonMain") && n.name == "Platform")
+        .expect("expect class node not found");
+    assert_eq!(actual_for_edges[0].target, expect_node.id);
+
+    let all_ids: Vec<String> = all_nodes.iter().map(|n| n.id.clone()).collect();
+    let decls = cg.db().get_kmp_declarations_for(&all_ids).await.unwrap();
+    assert_eq!(decls.iter().filter(|d| d.role == "expect").count(), 1);
+    assert_eq!(decls.iter().filter(|d| d.role == "actual").count(), 1);
+}

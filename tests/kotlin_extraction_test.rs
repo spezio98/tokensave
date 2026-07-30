@@ -673,3 +673,52 @@ fn actual_object_emits_actual_for_ref() {
         .collect();
     assert_eq!(refs.len(), 1, "object: {:?}", refs);
 }
+
+// -----------------------------------------------------------------------
+// typealias (#KMP typealias support Task 1)
+// -----------------------------------------------------------------------
+
+#[test]
+fn plain_typealias_extracted_no_actual_for_ref() {
+    let src = "typealias Foo = Bar\n";
+    let result = KotlinExtractor.extract("test.kt", src);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    let alias = result
+        .nodes
+        .iter()
+        .find(|n| n.name == "Foo" && matches!(n.kind, NodeKind::TypeAlias));
+    assert!(
+        alias.is_some(),
+        "no TypeAlias node: {:?}",
+        result
+            .nodes
+            .iter()
+            .map(|n| (&n.name, &n.kind))
+            .collect::<Vec<_>>()
+    );
+    assert!(result
+        .unresolved_refs
+        .iter()
+        .all(|r| r.reference_kind != EdgeKind::ActualFor));
+}
+
+#[test]
+fn actual_typealias_emits_actual_for_ref() {
+    let src = "actual typealias Platform = AndroidPlatform\n";
+    let result = KotlinExtractor.extract("shared/src/androidMain/kotlin/P.kt", src);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+    let alias_node = result
+        .nodes
+        .iter()
+        .find(|n| n.name == "Platform" && matches!(n.kind, NodeKind::TypeAlias))
+        .expect("typealias node not found");
+    let refs: Vec<_> = result
+        .unresolved_refs
+        .iter()
+        .filter(|r| r.reference_kind == EdgeKind::ActualFor)
+        .collect();
+    assert_eq!(refs.len(), 1, "expected one ActualFor ref, got {:?}", refs);
+    assert_eq!(refs[0].from_node_id, alias_node.id);
+    assert_eq!(refs[0].reference_name, alias_node.name);
+}
