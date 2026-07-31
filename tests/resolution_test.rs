@@ -1249,3 +1249,136 @@ async fn actual_typealias_does_not_link_to_expect_function() {
         "actual typealias must not link to an expect function"
     );
 }
+
+/// Helper: a Kotlin node named `name` of `kind` living at `file`.
+fn kmp_node(file: &str, kind: NodeKind, name: &str) -> Node {
+    Node {
+        id: generate_node_id(file, &kind, name, 1),
+        kind,
+        name: name.into(),
+        qualified_name: format!("{file}::{file}::{name}"),
+        file_path: file.into(),
+        start_line: 1,
+        attrs_start_line: 1,
+        end_line: 2,
+        start_column: 0,
+        end_column: 1,
+        signature: None,
+        docstring: None,
+        visibility: Visibility::Pub,
+        is_async: false,
+        branches: 0,
+        loops: 0,
+        returns: 0,
+        max_nesting: 0,
+        unsafe_blocks: 0,
+        unchecked_calls: 0,
+        assertions: 0,
+        cognitive_complexity: 0,
+        distinct_operators: 0,
+        distinct_operands: 0,
+        total_operators: 0,
+        total_operands: 0,
+        updated_at: 0,
+        parent_id: None,
+    }
+}
+
+/// A cross-module `Calls` reference to an `expect fun` must bind to the
+/// `expect` (Common source set), not to an arbitrary platform `actual`.
+/// Otherwise `callers(expect)` misses the caller — the reported bug.
+#[tokio::test]
+async fn call_to_expect_fun_binds_to_expect_not_platform_actual() {
+    let dir = TempDir::new().unwrap();
+    let (db, _) = Database::initialize(&dir.path().join("t.db"))
+        .await
+        .unwrap();
+
+    let expect_fn = kmp_node(
+        "shared/src/commonMain/kotlin/FileSaver.kt",
+        NodeKind::Function,
+        "saveFile",
+    );
+    let android_actual = kmp_node(
+        "shared/src/androidMain/kotlin/FileSaver.kt",
+        NodeKind::Function,
+        "saveFile",
+    );
+    let ios_actual = kmp_node(
+        "shared/src/iosMain/kotlin/FileSaver.kt",
+        NodeKind::Function,
+        "saveFile",
+    );
+    let caller = kmp_node(
+        "feature-payments/src/commonMain/kotlin/ProcessPaymentUseCase.kt",
+        NodeKind::Method,
+        "process",
+    );
+
+    // iOS actual first so a naive "first candidate wins" would mis-bind to it.
+    let nodes = vec![
+        ios_actual.clone(),
+        android_actual.clone(),
+        expect_fn.clone(),
+        caller.clone(),
+    ];
+    let resolver = ReferenceResolver::from_nodes(&db, &nodes);
+
+    let uref = UnresolvedRef {
+        from_node_id: caller.id.clone(),
+        reference_name: "saveFile".into(),
+        reference_kind: EdgeKind::Calls,
+        line: 1,
+        column: 0,
+        file_path: caller.file_path.clone(),
+    };
+    let resolved = resolver
+        .resolve_one(&uref)
+        .expect("call to expect fun should resolve");
+    assert_eq!(
+        resolved.target_node_id, expect_fn.id,
+        "cross-module call must bind to the expect, not a platform actual"
+    );
+}
+
+/// The expect preference must not override a same-file call: a platform
+/// caller invoking a symbol whose `actual` sits in its own file binds to that
+/// actual, not the expect.
+#[tokio::test]
+async fn same_file_platform_call_still_binds_to_local_actual() {
+    let dir = TempDir::new().unwrap();
+    let (db, _) = Database::initialize(&dir.path().join("t.db"))
+        .await
+        .unwrap();
+
+    let expect_fn = kmp_node(
+        "shared/src/commonMain/kotlin/FileSaver.kt",
+        NodeKind::Function,
+        "saveFile",
+    );
+    let ios_actual = kmp_node(
+        "shared/src/iosMain/kotlin/FileSaver.kt",
+        NodeKind::Function,
+        "saveFile",
+    );
+
+    let nodes = vec![expect_fn.clone(), ios_actual.clone()];
+    let resolver = ReferenceResolver::from_nodes(&db, &nodes);
+
+    // Caller lives in the same iOS file as the actual.
+    let uref = UnresolvedRef {
+        from_node_id: ios_actual.id.clone(),
+        reference_name: "saveFile".into(),
+        reference_kind: EdgeKind::Calls,
+        line: 1,
+        column: 0,
+        file_path: ios_actual.file_path.clone(),
+    };
+    let resolved = resolver
+        .resolve_one(&uref)
+        .expect("same-file call should resolve");
+    assert_eq!(
+        resolved.target_node_id, ios_actual.id,
+        "a same-file platform call must bind to its own actual"
+    );
+}
