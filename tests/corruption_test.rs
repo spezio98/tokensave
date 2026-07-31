@@ -220,6 +220,104 @@ async fn bulk_load_round_trip_preserves_data() {
     assert_eq!(results[0].node.id, "c1");
 }
 
+/// Root-cause regression: `end_bulk_load` must backfill the FTS index with the
+/// SAME columns the `nodes_fts` table declares — including `search_terms`
+/// (schema v14). If it omits `search_terms` (as it did before this fix), the
+/// external-content index is written without the camelCase word segments the
+/// content table carries, so those terms become unsearchable and, at scale,
+/// the inconsistent index later fails `begin_bulk_load` with a corruption
+/// error.
+///
+/// The detector is deterministic at any scale: `search_terms` emits the inner
+/// words of a camelCase identifier (`quxWobbleZorp` → "qux Wobble Zorp"),
+/// which the `unicode61` tokenizer does NOT produce from the `name` column (it
+/// indexes the whole identifier as one token). So an FTS match on such an
+/// inner word can only succeed if the backfill included `search_terms`.
+#[tokio::test]
+async fn end_bulk_load_backfills_search_terms_into_fts() {
+    let (db, _dir, _path) = setup_db().await;
+
+    // insert_nodes computes and stores `search_terms` for each node, so the
+    // content table has the column the FTS index must mirror.
+    let node = sample_node("k1", "quxWobbleZorp");
+
+    db.begin_bulk_load().await.unwrap();
+    db.insert_nodes(&[node]).await.unwrap();
+    db.end_bulk_load().await.unwrap();
+
+    // "wobble" lives only in the search_terms column (the name column indexes
+    // "quxwobblezorp" as a single token). A hit proves search_terms was
+    // backfilled; a four-column backfill would return zero rows.
+    let mut rows = db
+        .conn()
+        .query(
+            "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'wobble'",
+            (),
+        )
+        .await
+        .unwrap();
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    drop(rows); // release the read cursor before the next DDL/bulk load
+    assert_eq!(
+        count, 1,
+        "end_bulk_load must index the search_terms column (camelCase inner words)"
+    );
+
+    // FTS5's own consistency check must pass, and the next bulk load (as every
+    // subsequent `sync --force` performs) must not hit a corrupt index.
+    db.conn()
+        .execute_batch("INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check');")
+        .await
+        .expect("FTS index must be consistent after end_bulk_load");
+    db.begin_bulk_load()
+        .await
+        .expect("a second bulk load must not hit a corrupt FTS index");
+}
+
+/// A corrupt FTS5 index alone (rest of the DB intact) must not make
+/// `begin_bulk_load` fail: `integrity_check`/`quick_check` do not descend into
+/// FTS5, so the DB opens clean yet `DELETE FROM nodes_fts` inside
+/// `begin_bulk_load` fails with a corruption error. It should self-heal by
+/// rebuilding the FTS index and retrying, the same way the search path already
+/// does — this is the recovery net for databases already damaged in the wild.
+#[tokio::test]
+async fn begin_bulk_load_self_heals_corrupt_fts() {
+    let (db, _dir, _path) = setup_db().await;
+
+    // Enough rows that the FTS5 index spills into multiple `nodes_fts_data`
+    // blocks, so scrambling `id > 1` corrupts the index structure without
+    // touching the (intact) content in `nodes`.
+    let nodes: Vec<Node> = (0..200)
+        .map(|i| sample_node(&format!("n{i}"), &format!("handler_{i}")))
+        .collect();
+    db.insert_nodes(&nodes).await.unwrap();
+
+    // Corrupt the FTS5 index shadow table, leaving the `nodes` table intact.
+    // This reproduces "fts5: corrupt structure record" / "database disk image
+    // is malformed" that a plain `DELETE FROM nodes_fts` would then raise.
+    db.conn()
+        .execute_batch("UPDATE nodes_fts_data SET block = randomblob(length(block)) WHERE id > 1;")
+        .await
+        .unwrap();
+
+    // Sanity: the raw FTS clear that `begin_bulk_load` performs really does
+    // fail on this corrupt index, so the test is exercising the heal path.
+    assert!(
+        db.conn().execute_batch("DELETE FROM nodes_fts;").await.is_err(),
+        "precondition: corrupt FTS should make a plain DELETE fail"
+    );
+
+    // The real call must succeed by rebuilding the FTS and retrying.
+    db.begin_bulk_load()
+        .await
+        .expect("begin_bulk_load should self-heal a corrupt FTS index");
+
+    // And the load can complete normally, with search working afterwards.
+    db.end_bulk_load().await.unwrap();
+    let results = db.search_nodes("handler_0", 10).await.unwrap();
+    assert!(!results.is_empty(), "search should work after self-heal");
+}
+
 // ─── is_corruption_error ─────────────────────────────────────────────────
 
 #[test]
