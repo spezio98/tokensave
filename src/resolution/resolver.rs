@@ -798,6 +798,11 @@ impl<'a> ReferenceResolver<'a> {
         if kind_filtered.is_empty() {
             return None;
         }
+        // KMP: prefer the `expect` over platform `actual`s for common-code
+        // references, before either scorer picks an arbitrary actual.
+        if let Some(resolved) = try_kmp_expect_preference(uref, &kind_filtered) {
+            return Some(resolved);
+        }
         let candidates: &[&Node] = if kind_filtered.len() == raw_candidates.len() {
             raw_candidates
         } else {
@@ -871,6 +876,10 @@ impl<'a> ReferenceResolver<'a> {
             .collect();
         if kind_filtered.is_empty() {
             return None;
+        }
+        // KMP: prefer the `expect` over platform `actual`s (see try_exact_name_match).
+        if let Some(resolved) = try_kmp_expect_preference(uref, &kind_filtered) {
+            return Some(resolved);
         }
         let candidates: &[&Node] = if kind_filtered.len() == raw_candidates.len() {
             raw_candidates
@@ -1073,6 +1082,61 @@ fn kind_compatible(uref: &UnresolvedRef, target_kind: &NodeKind) -> bool {
 /// candidate list to a strict subset of `name_cache`. Mirrors the
 /// single-candidate / multi-candidate branches of
 /// `try_exact_name_match` but operates on the borrowed slice.
+/// KMP call/type resolution: when a Kotlin `Calls`/`Uses` reference has
+/// candidates that form an `expect`/`actual` family — the same bare name, the
+/// same logical nesting path, and the same owning module, spanning the Common
+/// source set and at least one platform source set — bind to the `expect`
+/// (Common) declaration instead of an arbitrary platform `actual`.
+///
+/// Without this, a reference from common code ties across the expect and every
+/// actual in the scorers below and the edge lands on whichever actual (e.g.
+/// iOS) happens to sort first. `callers`/`callees` on the `expect` then miss
+/// that reference, and cross-module navigation through the canonical
+/// declaration breaks. Candidates in the reference's own file are left to the
+/// normal scoring, so an in-file platform call still binds to its own actual.
+fn try_kmp_expect_preference(uref: &UnresolvedRef, candidates: &[&Node]) -> Option<ResolvedRef> {
+    use crate::extraction::kmp::{kmp_location_from_path, KmpLocation, KmpTarget};
+
+    if !matches!(uref.reference_kind, EdgeKind::Calls | EdgeKind::Uses) {
+        return None;
+    }
+    // A co-located candidate is a stronger, more specific signal than the
+    // expect preference — defer to the normal same-file scoring.
+    if candidates.iter().any(|n| n.file_path == uref.file_path) {
+        return None;
+    }
+
+    let located: Vec<(&Node, KmpLocation)> = candidates
+        .iter()
+        .filter_map(|n| kmp_location_from_path(&n.file_path).map(|loc| (*n, loc)))
+        .collect();
+
+    // The `expect` is the Common-source-set member.
+    let (expect_node, expect_loc) = located
+        .iter()
+        .find(|(_, loc)| loc.target == KmpTarget::Common)?;
+    let expect_logical = kmp_logical_path(expect_node);
+
+    // Require at least one platform `actual` in the same family, otherwise this
+    // is just a Common declaration that happens to share a name with unrelated
+    // nodes — not an expect/actual family, so leave it to normal scoring.
+    let has_platform_actual = located.iter().any(|(n, loc)| {
+        loc.target != KmpTarget::Common
+            && loc.module_root == expect_loc.module_root
+            && kmp_logical_path(n) == expect_logical
+    });
+    if !has_platform_actual {
+        return None;
+    }
+
+    Some(ResolvedRef {
+        original: uref.clone(),
+        target_node_id: expect_node.id.clone(),
+        confidence: 0.9,
+        resolved_by: "kmp-expect".to_string(),
+    })
+}
+
 fn resolve_from_filtered(uref: &UnresolvedRef, kind_filtered: &[&Node]) -> Option<ResolvedRef> {
     resolve_from_filtered_named(uref, kind_filtered, "exact-match")
 }
