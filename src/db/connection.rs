@@ -307,14 +307,12 @@ impl Database {
         Ok(())
     }
 
-    /// Drops secondary indexes, disables fsync/FK, and clears FTS for fast
-    /// bulk loading. Callers should insert data sorted by PK so the primary
-    /// B-tree gets sequential appends. Call `end_bulk_load` afterwards to
-    /// rebuild indexes in one optimized pass.
-    pub async fn begin_bulk_load(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
-                "PRAGMA foreign_keys = OFF;
+    /// SQL that drops secondary indexes/triggers and clears the FTS index to
+    /// prepare for a fast bulk load. Split out so `begin_bulk_load` can retry
+    /// it verbatim after a self-healing FTS rebuild. Every statement is
+    /// idempotent (`IF EXISTS` / `DELETE`), so re-running after a partial
+    /// failure is safe.
+    const BEGIN_BULK_LOAD_SQL: &'static str = "PRAGMA foreign_keys = OFF;
              DROP INDEX IF EXISTS idx_nodes_kind;
              DROP INDEX IF EXISTS idx_nodes_name;
              DROP INDEX IF EXISTS idx_nodes_qualified_name;
@@ -336,11 +334,44 @@ impl Database {
              DROP TRIGGER IF EXISTS trait_dispatch_implements_insert;
              DROP TRIGGER IF EXISTS trait_dispatch_call_delete;
              DROP TRIGGER IF EXISTS trait_dispatch_implements_delete;
-             DELETE FROM nodes_fts;",
-            )
+             DELETE FROM nodes_fts;";
+
+    /// Drops secondary indexes, disables fsync/FK, and clears FTS for fast
+    /// bulk loading. Callers should insert data sorted by PK so the primary
+    /// B-tree gets sequential appends. Call `end_bulk_load` afterwards to
+    /// rebuild indexes in one optimized pass.
+    ///
+    /// The trailing `DELETE FROM nodes_fts` touches the FTS5 index, which can
+    /// be corrupt on its own while the rest of the database is intact. `PRAGMA
+    /// integrity_check`/`quick_check` do not descend into FTS5, so the DB opens
+    /// clean yet this `DELETE` fails with a corruption error ("database disk
+    /// image is malformed" / "fts5: corrupt structure record"). This is a
+    /// recovery net for databases already damaged that way — historically by
+    /// `end_bulk_load` writing the FTS with the wrong column set (see its note)
+    /// and, in general, by an interrupted or killed prior sync. Mirror the
+    /// self-heal the search path already uses (`search_nodes`): on a corruption
+    /// error, rebuild the FTS index from the `nodes` content and retry once.
+    pub async fn begin_bulk_load(&self) -> Result<()> {
+        let first = self.conn.execute_batch(Self::BEGIN_BULK_LOAD_SQL).await;
+        let Err(e) = first else {
+            return Ok(());
+        };
+
+        let err = TokenSaveError::Database {
+            message: format!("failed to begin bulk load: {e}"),
+            operation: "begin_bulk_load".to_string(),
+        };
+        if !Self::is_corruption_error(&err) {
+            return Err(err);
+        }
+
+        eprintln!("[tokensave] FTS index corruption detected during bulk load — rebuilding…");
+        self.rebuild_fts().await?;
+        self.conn
+            .execute_batch(Self::BEGIN_BULK_LOAD_SQL)
             .await
             .map_err(|e| TokenSaveError::Database {
-                message: format!("failed to begin bulk load: {e}"),
+                message: format!("failed to begin bulk load after FTS rebuild: {e}"),
                 operation: "begin_bulk_load".to_string(),
             })?;
         Ok(())
@@ -348,6 +379,17 @@ impl Database {
 
     /// Recreates secondary indexes (benefiting from sorted row order),
     /// restores FTS triggers and content, and re-enables normal durability.
+    ///
+    /// The `nodes_fts` triggers and the backfill `SELECT` MUST list the same
+    /// columns as the FTS5 table declared in `create_schema`/migrations —
+    /// currently `name, qualified_name, docstring, signature, search_terms`.
+    /// `search_terms` was added in schema v14 (porter stemming / index-time
+    /// camelCase terms) but only in `migrations.rs`; leaving these statements
+    /// at the old four-column shape wrote a `search_terms`-less index over an
+    /// external-content (`content='nodes'`) FTS whose content table *does*
+    /// carry `search_terms`. Every full index then left the FTS structurally
+    /// inconsistent, so the next sync's `begin_bulk_load` failed with a
+    /// corruption error. Keep this list in lockstep with the schema.
     pub async fn end_bulk_load(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
@@ -363,21 +405,21 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_unresolved_refs_reference_name ON unresolved_refs(reference_name);
              CREATE INDEX IF NOT EXISTS idx_unresolved_refs_file_path ON unresolved_refs(file_path);
              CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
-                 INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
-                 VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+                 INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+                 VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
              END;
              CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
-                 INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature)
-                 VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
+                 INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+                 VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
              END;
              CREATE TRIGGER IF NOT EXISTS nodes_fts_update AFTER UPDATE ON nodes BEGIN
-                 INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature)
-                 VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature);
-                 INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
-                 VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
+                 INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, docstring, signature, search_terms)
+                 VALUES ('delete', OLD.rowid, OLD.name, OLD.qualified_name, OLD.docstring, OLD.signature, OLD.search_terms);
+                 INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+                 VALUES (NEW.rowid, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature, NEW.search_terms);
              END;
-             INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature)
-                 SELECT rowid, name, qualified_name, docstring, signature FROM nodes;
+             INSERT INTO nodes_fts(rowid, name, qualified_name, docstring, signature, search_terms)
+                 SELECT rowid, name, qualified_name, docstring, signature, search_terms FROM nodes;
              PRAGMA foreign_keys = ON;",
         ).await.map_err(|e| TokenSaveError::Database {
             message: format!("failed to end bulk load: {e}"),
