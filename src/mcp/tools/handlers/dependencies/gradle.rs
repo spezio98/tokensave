@@ -55,8 +55,8 @@ pub fn parse(root: &Path) -> Result<Workspace> {
     let mut members: Vec<Member> = Vec::new();
 
     // Root build file.
-    if let Some(m) = parse_build_file(root, root, ".") {
-        members.push(m);
+    if let Some(ms) = parse_build_file(root, root, ".") {
+        members.extend(ms);
     }
 
     // Multi-module projects — settings.gradle(.kts) `include 'mod'` /
@@ -67,8 +67,8 @@ pub fn parse(root: &Path) -> Result<Workspace> {
         // them into filesystem paths (`lib/core`).
         let fs_rel = module.trim_start_matches(':').replace(':', "/");
         let module_dir = root.join(&fs_rel);
-        if let Some(m) = parse_build_file(root, &module_dir, &fs_rel) {
-            members.push(m);
+        if let Some(ms) = parse_build_file(root, &module_dir, &fs_rel) {
+            members.extend(ms);
         }
     }
 
@@ -95,7 +95,7 @@ pub fn parse(root: &Path) -> Result<Workspace> {
     })
 }
 
-fn parse_build_file(_root: &Path, module_dir: &Path, rel: &str) -> Option<Member> {
+fn parse_build_file(_root: &Path, module_dir: &Path, rel: &str) -> Option<Vec<Member>> {
     let kts = module_dir.join("build.gradle.kts");
     let groovy = module_dir.join("build.gradle");
     let (path, language_key) = if kts.exists() {
@@ -107,27 +107,47 @@ fn parse_build_file(_root: &Path, module_dir: &Path, rel: &str) -> Option<Member
     };
 
     let raw = std::fs::read_to_string(&path).ok()?;
-    let deps = extract_deps_from_source(&raw, language_key)?;
+    let deps_by_scope = extract_deps_from_source(&raw, language_key)?;
 
-    Some(Member {
-        path: rel.to_string(),
-        name: if rel
-            .trim_start_matches('.')
-            .trim_start_matches('/')
-            .is_empty()
-        {
-            module_dir
-                .file_name()
-                .map_or_else(|| "root".to_string(), |s| s.to_string_lossy().into_owned())
-        } else {
-            rel.to_string()
-        },
-        license: None,
-        deps,
-    })
+    let module_name = if rel
+        .trim_start_matches('.')
+        .trim_start_matches('/')
+        .is_empty()
+    {
+        module_dir
+            .file_name()
+            .map_or_else(|| "root".to_string(), |s| s.to_string_lossy().into_owned())
+    } else {
+        rel.to_string()
+    };
+
+    let members = deps_by_scope
+        .into_iter()
+        .map(|(scope, deps)| match scope {
+            None => Member {
+                path: rel.to_string(),
+                name: module_name.clone(),
+                license: None,
+                deps,
+            },
+            // Virtual member for a KMP source set (#Phase 3) -- same pattern
+            // parse_version_catalog already uses to expose non-module data
+            // through the standard Member/Workspace rendering path.
+            Some(source_set) => Member {
+                path: format!("{rel}::{source_set}"),
+                name: format!("{module_name}::{source_set}"),
+                license: None,
+                deps,
+            },
+        })
+        .collect();
+    Some(members)
 }
 
-fn extract_deps_from_source(source: &str, language_key: &str) -> Option<Vec<Dep>> {
+fn extract_deps_from_source(
+    source: &str,
+    language_key: &str,
+) -> Option<std::collections::BTreeMap<Option<String>, Vec<Dep>>> {
     let language = if language_key == "groovy" {
         dekobon_tree_sitter_groovy::LANGUAGE.into()
     } else {
@@ -136,21 +156,57 @@ fn extract_deps_from_source(source: &str, language_key: &str) -> Option<Vec<Dep>
     let mut parser = Parser::new();
     parser.set_language(&language).ok()?;
     let tree = parser.parse(source, None)?;
-    let mut deps = Vec::new();
-    walk_for_dep_calls(tree.root_node(), source.as_bytes(), &mut deps);
+    let mut deps = std::collections::BTreeMap::new();
+    walk_for_dep_calls(tree.root_node(), source.as_bytes(), None, &mut deps);
     Some(deps)
+}
+
+/// Detects a KMP type-safe source-set dependency block: `<name>.dependencies { ... }`.
+/// Returns the source-set name (e.g. `"commonMain"`) if `node` matches, else `None`.
+/// No whitelist of names — the identifier itself names the source-set, covering
+/// any target (`commonMain`, `androidMain`, `iosMain`, `jvmMain`, custom names, ...).
+fn detect_sourceset_dependencies_block(node: Node<'_>, src: &[u8]) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let nav = node.child(0)?;
+    if nav.kind() != "navigation_expression" {
+        return None;
+    }
+    let source_set_node = nav.child(0)?;
+    if !source_set_node.kind().contains("identifier") {
+        return None;
+    }
+    let suffix = nav.child(1)?;
+    let suffix_text = suffix.utf8_text(src).ok()?;
+    if suffix_text.trim_start_matches('.') != "dependencies" {
+        return None;
+    }
+    source_set_node.utf8_text(src).ok().map(str::to_string)
 }
 
 /// Walk the AST and accept any node whose first child is an identifier
 /// matching a Gradle configuration keyword, where one of its arguments is
-/// a string shaped like `"group:name[:version]"`.
-fn walk_for_dep_calls(node: Node<'_>, src: &[u8], out: &mut Vec<Dep>) {
+/// a string shaped like `"group:name[:version]"`. `current_scope` tracks
+/// which KMP source-set (if any) the walk is currently nested inside, so
+/// each extracted dep can be bucketed by source-set instead of collapsed
+/// into one flat list.
+fn walk_for_dep_calls(
+    node: Node<'_>,
+    src: &[u8],
+    current_scope: Option<&str>,
+    out: &mut std::collections::BTreeMap<Option<String>, Vec<Dep>>,
+) {
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
-            try_extract_call(child, src, out);
-            walk_for_dep_calls(child, src, out);
+            try_extract_call(child, src, current_scope, out);
+            let child_scope = detect_sourceset_dependencies_block(child, src);
+            match &child_scope {
+                Some(name) => walk_for_dep_calls(child, src, Some(name), out),
+                None => walk_for_dep_calls(child, src, current_scope, out),
+            }
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -158,7 +214,12 @@ fn walk_for_dep_calls(node: Node<'_>, src: &[u8], out: &mut Vec<Dep>) {
     }
 }
 
-fn try_extract_call(node: Node<'_>, src: &[u8], out: &mut Vec<Dep>) {
+fn try_extract_call(
+    node: Node<'_>,
+    src: &[u8],
+    scope: Option<&str>,
+    out: &mut std::collections::BTreeMap<Option<String>, Vec<Dep>>,
+) {
     // We want `<identifier>(<args>)` or `<identifier> <args>` (Groovy can
     // omit parens). Identify the leading identifier and the first string
     // argument anywhere in the subtree.
@@ -173,7 +234,7 @@ fn try_extract_call(node: Node<'_>, src: &[u8], out: &mut Vec<Dep>) {
         return;
     };
     if let Some(dep) = parse_coordinate(&spec, *kind) {
-        out.push(dep);
+        out.entry(scope.map(str::to_string)).or_default().push(dep);
     }
 }
 
@@ -461,6 +522,79 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn groups_kmp_sourceset_deps_by_source_set() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "build.gradle.kts",
+            r#"kotlin {
+    androidTarget()
+    iosX64()
+    sourceSets {
+        commonMain.dependencies {
+            implementation("io.ktor:ktor-client-core:2.3.0")
+        }
+        androidMain.dependencies {
+            implementation("com.google.android.material:material:1.9.0")
+        }
+        iosMain.dependencies {
+            implementation("io.ktor:ktor-client-darwin:2.3.0")
+        }
+    }
+}
+"#,
+        );
+        let ws = parse(dir.path()).unwrap();
+
+        let common = ws
+            .members
+            .iter()
+            .find(|m| m.path == ".::commonMain")
+            .expect("commonMain virtual member missing");
+        assert_eq!(common.deps.len(), 1);
+        assert_eq!(common.deps[0].name, "io.ktor:ktor-client-core");
+
+        let android = ws
+            .members
+            .iter()
+            .find(|m| m.path == ".::androidMain")
+            .expect("androidMain virtual member missing");
+        assert_eq!(android.deps.len(), 1);
+        assert_eq!(android.deps[0].name, "com.google.android.material:material");
+
+        let ios = ws
+            .members
+            .iter()
+            .find(|m| m.path == ".::iosMain")
+            .expect("iosMain virtual member missing");
+        assert_eq!(ios.deps.len(), 1);
+        assert_eq!(ios.deps[0].name, "io.ktor:ktor-client-darwin");
+
+        assert!(android.name.ends_with("::androidMain"));
+    }
+
+    #[test]
+    fn flat_dependencies_block_still_yields_one_member() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "build.gradle.kts",
+            r#"dependencies {
+    implementation("org.jetbrains.kotlin:kotlin-stdlib:2.0.0")
+}
+"#,
+        );
+        let ws = parse(dir.path()).unwrap();
+        let root_members: Vec<_> = ws.members.iter().filter(|m| m.path == ".").collect();
+        assert_eq!(
+            root_members.len(),
+            1,
+            "flat (non-KMP) build file must yield exactly one member"
+        );
+        assert_eq!(root_members[0].deps.len(), 1);
     }
 
     #[test]
